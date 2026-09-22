@@ -1823,6 +1823,7 @@ PODS:
     - React-utils (= 0.86.2)
     - ReactNativeDependencies
   - ReactNativeDependencies (0.86.2)
+  - secp256k1.swift (0.1.4)
   - WalletKeystore (0.1.0):
     - hermes-engine
     - RCTRequired
@@ -1844,6 +1845,7 @@ PODS:
     - ReactCommon/turbomodule/bridging
     - ReactCommon/turbomodule/core
     - ReactNativeDependencies
+    - secp256k1.swift (~> 0.1)
     - Yoga
   - Yoga (0.0.0)
 
@@ -1925,6 +1927,10 @@ DEPENDENCIES:
   - ReactNativeDependencies (from `../node_modules/react-native/third-party-podspecs/ReactNativeDependencies.podspec`)
   - WalletKeystore (from `../..`)
   - Yoga (from `../node_modules/react-native/ReactCommon/yoga`)
+
+SPEC REPOS:
+  trunk:
+    - secp256k1.swift
 
 EXTERNAL SOURCES:
   FBLazyVector:
@@ -2156,7 +2162,8 @@ SPEC CHECKSUMS:
   ReactCodegen: 3bbb7de19774794a7428ef623a7b777106cf3737
   ReactCommon: 9002f006f571256348994183f7d4387aa7cf84e8
   ReactNativeDependencies: 2bd6854ade79bf1b60586d1ab7813a389df1b6bf
-  WalletKeystore: defc569c58b8a2784dc221dbc20ed234366000a8
+  secp256k1.swift: a7e7a214f6db6ce5db32cc6b2b45e5c4dd633634
+  WalletKeystore: db716953865b6c621bed510539c6e3ded5c0d481
   Yoga: 8cf9dd9fc7761e176a3361b4821d26d11cfbeab1
 
 PODFILE CHECKSUM: 909fc28eec13c1855a6d1c4b82112df929b58018

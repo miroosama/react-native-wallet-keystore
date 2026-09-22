@@ -55,4 +55,8 @@ dependencies {
 
   // BiometricPrompt, plus the FragmentActivity it requires as a host.
   implementation "androidx.biometric:biometric:1.1.0"
+
+  // secp256k1. Android's bundled BouncyCastle is stripped and shadowed, so the
+  // full provider is pulled in explicitly rather than relying on the platform's.
+  implementation "org.bouncycastle:bcprov-jdk18on:1.78.1"
 }

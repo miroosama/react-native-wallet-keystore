@@ -7,6 +7,15 @@ const mockStoreSecret =
 const mockGetSecret = jest.fn<(k: string, r: string) => Promise<string>>();
 const mockHasSecret = jest.fn<(k: string) => Promise<boolean>>();
 const mockDeleteSecret = jest.fn<(k: string) => Promise<void>>();
+const mockGenerateKey =
+  jest.fn<(k: string, p: string, i: string) => Promise<string>>();
+const mockImportPrivateKey =
+  jest.fn<(k: string, pk: string, p: string, i: string) => Promise<string>>();
+const mockGetPublicKey = jest.fn<(k: string) => Promise<string>>();
+const mockSignDigest =
+  jest.fn<(k: string, d: string, r: string) => Promise<string>>();
+const mockExportPrivateKey =
+  jest.fn<(k: string, r: string) => Promise<string>>();
 
 jest.mock('../NativeWalletKeystore', () => ({
   __esModule: true,
@@ -19,16 +28,27 @@ jest.mock('../NativeWalletKeystore', () => ({
     getSecret: (k: string, r: string) => mockGetSecret(k, r),
     hasSecret: (k: string) => mockHasSecret(k),
     deleteSecret: (k: string) => mockDeleteSecret(k),
+    generateKey: (k: string, p: string, i: string) => mockGenerateKey(k, p, i),
+    importPrivateKey: (k: string, pk: string, p: string, i: string) =>
+      mockImportPrivateKey(k, pk, p, i),
+    getPublicKey: (k: string) => mockGetPublicKey(k),
+    signDigest: (k: string, d: string, r: string) => mockSignDigest(k, d, r),
+    exportPrivateKey: (k: string, r: string) => mockExportPrivateKey(k, r),
   },
 }));
 
 import {
   authenticate,
   deleteSecret,
+  exportPrivateKey,
+  generateKey,
   getBiometryType,
+  getPublicKey,
   getSecret,
   hasSecret,
+  importPrivateKey,
   KeystoreError,
+  signDigest,
   storeSecret,
   type KeystoreErrorCode,
 } from '../index';
@@ -46,7 +66,16 @@ beforeEach(() => {
   mockGetSecret.mockResolvedValue('deadbeef');
   mockHasSecret.mockResolvedValue(true);
   mockDeleteSecret.mockResolvedValue(undefined);
+  mockGenerateKey.mockResolvedValue(PUBLIC_KEY);
+  mockImportPrivateKey.mockResolvedValue(PUBLIC_KEY);
+  mockGetPublicKey.mockResolvedValue(PUBLIC_KEY);
+  mockSignDigest.mockResolvedValue('ab'.repeat(65));
+  mockExportPrivateKey.mockResolvedValue(PRIVATE_KEY);
 });
+
+const PUBLIC_KEY = '04' + 'aa'.repeat(64);
+const PRIVATE_KEY = '4c'.repeat(32);
+const DIGEST = '0x' + 'cd'.repeat(32);
 
 describe('authenticate', () => {
   it('applies the default policy when omitted', async () => {
@@ -89,6 +118,7 @@ describe('error mapping', () => {
     'KEY_ALREADY_EXISTS',
     'KEY_INVALIDATED',
     'STORAGE_ERROR',
+    'INVALID_KEY',
     'UNKNOWN',
   ];
 
@@ -299,5 +329,122 @@ describe('hasSecret / deleteSecret', () => {
   it('deletes idempotently', async () => {
     await expect(deleteSecret('wallet')).resolves.toBeUndefined();
     expect(mockDeleteSecret).toHaveBeenCalledWith('wallet');
+  });
+});
+
+describe('generateKey', () => {
+  it('returns a 0x-prefixed public key and never a private one', async () => {
+    const publicKey = await generateKey('wallet');
+
+    expect(publicKey).toBe(`0x${PUBLIC_KEY}`);
+    // The private key must not transit the bridge during generation; only a
+    // keyId, the policies, and the public key ever appear in this exchange.
+    expect(mockGenerateKey).toHaveBeenCalledWith(
+      'wallet',
+      'biometricOrPasscode',
+      'never'
+    );
+  });
+
+  it('keeps invalidation independent of the auth policy', async () => {
+    await generateKey('wallet', { policy: 'biometricOnly' });
+
+    expect(mockGenerateKey).toHaveBeenCalledWith(
+      'wallet',
+      'biometricOnly',
+      'never'
+    );
+  });
+});
+
+describe('importPrivateKey', () => {
+  it('strips 0x before crossing the bridge', async () => {
+    await importPrivateKey('wallet', `0x${PRIVATE_KEY}`);
+
+    expect(mockImportPrivateKey).toHaveBeenCalledWith(
+      'wallet',
+      PRIVATE_KEY,
+      'biometricOrPasscode',
+      'never'
+    );
+  });
+
+  it.each([
+    ['too short', '00'.repeat(31)],
+    ['too long', '00'.repeat(33)],
+    ['non-hex', 'zz'.repeat(32)],
+    ['empty', ''],
+  ])('rejects a %s key as INVALID_KEY before native', async (_l, value) => {
+    await expect(importPrivateKey('wallet', value)).rejects.toMatchObject({
+      code: 'INVALID_KEY',
+    });
+    expect(mockImportPrivateKey).not.toHaveBeenCalled();
+  });
+
+  it('defers the range check to native', async () => {
+    // Zero is correctly shaped but out of range. Whether it is in [1, n-1] is
+    // a curve question, so native owns it rather than duplicating the order.
+    mockImportPrivateKey.mockRejectedValue(nativeRejection('INVALID_KEY'));
+
+    await expect(
+      importPrivateKey('wallet', '00'.repeat(32))
+    ).rejects.toMatchObject({ code: 'INVALID_KEY' });
+    expect(mockImportPrivateKey).toHaveBeenCalled();
+  });
+});
+
+describe('signDigest', () => {
+  it('sends a bare 32-byte digest and returns a 0x signature', async () => {
+    const signature = await signDigest('wallet', DIGEST, 'Sign');
+
+    expect(mockSignDigest).toHaveBeenCalledWith(
+      'wallet',
+      'cd'.repeat(32),
+      'Sign'
+    );
+    expect(signature).toBe(`0x${'ab'.repeat(65)}`);
+  });
+
+  it.each([
+    ['31 bytes', '0x' + 'cd'.repeat(31)],
+    ['33 bytes', '0x' + 'cd'.repeat(33)],
+    ['not hex', '0x' + 'zz'.repeat(32)],
+  ])('rejects a digest that is %s', async (_l, value) => {
+    // A short digest would be silently zero-padded by some native paths and
+    // sign the wrong thing, so the length is enforced before the bridge.
+    await expect(signDigest('wallet', value, 'Sign')).rejects.toMatchObject({
+      code: 'INVALID_KEY',
+    });
+    expect(mockSignDigest).not.toHaveBeenCalled();
+  });
+
+  it('requires a non-empty reason', async () => {
+    await expect(signDigest('wallet', DIGEST, '  ')).rejects.toBeInstanceOf(
+      KeystoreError
+    );
+    expect(mockSignDigest).not.toHaveBeenCalled();
+  });
+});
+
+describe('getPublicKey / exportPrivateKey', () => {
+  it('reads the public key without authenticating', async () => {
+    await expect(getPublicKey('wallet')).resolves.toBe(`0x${PUBLIC_KEY}`);
+    expect(mockSignDigest).not.toHaveBeenCalled();
+    expect(mockAuthenticate).not.toHaveBeenCalled();
+  });
+
+  it('requires a reason to export', async () => {
+    await expect(exportPrivateKey('wallet', '')).rejects.toBeInstanceOf(
+      KeystoreError
+    );
+    expect(mockExportPrivateKey).not.toHaveBeenCalled();
+  });
+
+  it('surfaces KEY_NOT_FOUND from getPublicKey', async () => {
+    mockGetPublicKey.mockRejectedValue(nativeRejection('KEY_NOT_FOUND'));
+
+    await expect(getPublicKey('missing')).rejects.toMatchObject({
+      code: 'KEY_NOT_FOUND',
+    });
   });
 });

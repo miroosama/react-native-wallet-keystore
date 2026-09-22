@@ -2,7 +2,8 @@
   "compilerOptions": {
     "rootDir": ".",
     "paths": {
-      "react-native-wallet-keystore": ["./src/index"]
+      "react-native-wallet-keystore": ["./src/index"],
+      "react-native-wallet-keystore/viem": ["./src/viem"]
     },
     "allowUnreachableCode": false,
     "allowUnusedLabels": false,

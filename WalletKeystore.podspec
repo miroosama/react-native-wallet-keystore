@@ -18,7 +18,12 @@ Pod::Spec.new do |s|
 
   # Not linked by install_modules_dependencies, which only wires up the React
   # Native dependencies.
-  s.frameworks = "LocalAuthentication"
+  s.frameworks = "LocalAuthentication", "Security"
+
+  # bitcoin-core/libsecp256k1 with the recovery module compiled in. The
+  # recovery module is what yields Ethereum's `v` directly, rather than
+  # recovering the public key four times and comparing.
+  s.dependency "secp256k1.swift", "~> 0.1"
 
   install_modules_dependencies(s)
 end

@@ -1,0 +1,50 @@
+{
+  "privateKey": "0x4c0883a69102937d6231471b5dbb6204fe512961708279e2d0f3d5f0f0f0a1b2",
+  "address": "0xB0DB1650cE5881A80c4d2Fdb82D1637f2e8f2cD1",
+  "publicKey": "0x048f0d4f7f7740d2ffe4edea1981060efa589206398879354f8b51297d6b7b661fc6fe9cd8f8793c2db38492d90b91b13570865e9afee52f42ce741e1a12400bd0",
+  "vectors": [
+    {
+      "digest": "0xdc076e3c1cc25070abe6ebea7239bf31f3f75b56c246fe3d41d5288e872d11a1",
+      "signature": "0xea11a178f92c7e2fc0b12abc2fd3924f1c804b5fb2a111a0e720f7ab7a48f93b0a66a4eda0ff0bb50ce7065581c39d4340b34aae8a3a148c45ae834cbf3216b21b",
+      "r": "0xea11a178f92c7e2fc0b12abc2fd3924f1c804b5fb2a111a0e720f7ab7a48f93b",
+      "s": "0x0a66a4eda0ff0bb50ce7065581c39d4340b34aae8a3a148c45ae834cbf3216b2",
+      "v": 27,
+      "lowS": true,
+      "recovered": "0xB0DB1650cE5881A80c4d2Fdb82D1637f2e8f2cD1"
+    },
+    {
+      "digest": "0x171debede9ed48c7f627fddbbc4f05e315987b2155665dea674bc262e094f67d",
+      "signature": "0xaba5b644b8ede82f55ead8f36274d45ea7c5d18c328d99bbeafec8f7624804657d16ce12f2760af50c6edd5cef773eab53a5ded86746b1e02db1d30ab7f376a11c",
+      "r": "0xaba5b644b8ede82f55ead8f36274d45ea7c5d18c328d99bbeafec8f762480465",
+      "s": "0x7d16ce12f2760af50c6edd5cef773eab53a5ded86746b1e02db1d30ab7f376a1",
+      "v": 28,
+      "lowS": true,
+      "recovered": "0xB0DB1650cE5881A80c4d2Fdb82D1637f2e8f2cD1"
+    },
+    {
+      "digest": "0x0000000000000000000000000000000000000000000000000000000000000001",
+      "signature": "0x4cdd99892e182ca2eea09bc6b52b710941c1d3c1c673654c720226788dc4485a6b33eea485af2ecd15c43ce3f4692199a00875314153e0d6a9eac10d18d864311b",
+      "r": "0x4cdd99892e182ca2eea09bc6b52b710941c1d3c1c673654c720226788dc4485a",
+      "s": "0x6b33eea485af2ecd15c43ce3f4692199a00875314153e0d6a9eac10d18d86431",
+      "v": 27,
+      "lowS": true,
+      "recovered": "0xB0DB1650cE5881A80c4d2Fdb82D1637f2e8f2cD1"
+    },
+    {
+      "digest": "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "signature": "0xfd44036e85ba0776b6048bf0d23c79432e75a73a2f9843c559aa248b674a2407217dcf718b098cf5c56375fde7230607b842cd0d25a912eccec0f9f41cf6aecb1c",
+      "r": "0xfd44036e85ba0776b6048bf0d23c79432e75a73a2f9843c559aa248b674a2407",
+      "s": "0x217dcf718b098cf5c56375fde7230607b842cd0d25a912eccec0f9f41cf6aecb",
+      "v": 28,
+      "lowS": true,
+      "recovered": "0xB0DB1650cE5881A80c4d2Fdb82D1637f2e8f2cD1"
+    }
+  ],
+  "curveOrder": "0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141",
+  "halfCurveOrder": "0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0",
+  "messageVector": {
+    "message": "hello wallet",
+    "hash": "0x65abde5e8022141d3e82f861a595a6c1cdd0496a6477d7b1e60244eb853e7f74",
+    "signature": "0xee57610d55ae255be0ba4311611bd71bcdffff76cdc1c2a6fc607360bf04e8a85f1700db8ccdef102bb509f38efbbeabf597d5b19bcfc992f019d3102fa281a51c"
+  }
+}

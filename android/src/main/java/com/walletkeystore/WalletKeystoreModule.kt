@@ -6,34 +6,61 @@ import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
-import javax.crypto.Cipher
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.UiThreadUtil
+import java.math.BigInteger
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.crypto.Cipher
 
 class WalletKeystoreModule(reactContext: ReactApplicationContext) :
   NativeWalletKeystoreSpec(reactContext) {
 
   /**
-   * Ensures a promise is settled exactly once.
+   * Where an operation's result goes.
+   *
+   * The storage operations are reused internally by the signing ones, which
+   * need to intercept the result rather than forward it to JS. Settling through
+   * this instead of a `Promise` keeps that composition honest — there is no
+   * hand-written stand-in for React Native's interface to drift out of date.
+   */
+  private interface Settler {
+    fun resolve(value: Any?)
+    fun reject(code: String, message: String)
+  }
+
+  /**
+   * Settles a promise exactly once.
    *
    * BiometricPrompt can deliver a terminal callback while an earlier failure
    * path is already unwinding — a cancel racing an error, most often. Settling
    * a React Native promise twice throws, so the race is collapsed here rather
    * than guarded at each call site.
    */
-  private class PromiseGuard(private val promise: Promise) {
+  private class PromiseGuard(private val promise: Promise) : Settler {
     private val settled = AtomicBoolean(false)
 
-    fun resolve(value: Any?) {
+    override fun resolve(value: Any?) {
       if (settled.compareAndSet(false, true)) promise.resolve(value)
     }
 
-    fun reject(code: String, message: String) {
+    override fun reject(code: String, message: String) {
       if (settled.compareAndSet(false, true)) promise.reject(code, message)
     }
   }
+
+  /** Routes a nested operation's outcome back into the caller's own handling. */
+  private class Relay(
+    private val onResolve: (Any?) -> Unit,
+    private val onReject: (String, String) -> Unit,
+  ) : Settler {
+    override fun resolve(value: Any?) = onResolve(value)
+    override fun reject(code: String, message: String) = onReject(code, message)
+  }
+
+  // ---------------------------------------------------------------------------
+  // Authentication
+  // ---------------------------------------------------------------------------
 
   override fun getBiometryType(promise: Promise) {
     val pm = reactApplicationContext.packageManager
@@ -50,9 +77,11 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
       Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
         pm.hasSystemFeature(PackageManager.FEATURE_IRIS)
 
-    val present = listOf(hasFingerprint to "fingerprint", hasFace to "face", hasIris to "iris")
-      .filter { it.first }
-      .map { it.second }
+    val present = listOf(
+      hasFingerprint to "fingerprint",
+      hasFace to "face",
+      hasIris to "iris"
+    ).filter { it.first }.map { it.second }
 
     promise.resolve(
       when {
@@ -76,9 +105,6 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
       return
     }
 
-    // Null when the app is backgrounded, and not a FragmentActivity if the host
-    // app uses a plain Activity. BiometricPrompt requires one, so both are the
-    // same failure. `is` covers null as well.
     val activity = reactApplicationContext.currentActivity
     if (activity !is FragmentActivity) {
       guard.reject(
@@ -89,13 +115,10 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
     }
 
     val authenticators = authenticatorsFor(policy)
-
-    when (val status = BiometricManager.from(reactApplicationContext).canAuthenticate(authenticators)) {
-      BiometricManager.BIOMETRIC_SUCCESS -> Unit
-      else -> {
-        guard.reject(mapAvailability(status), availabilityMessage(status, authenticators))
-        return
-      }
+    val status = BiometricManager.from(reactApplicationContext).canAuthenticate(authenticators)
+    if (status != BiometricManager.BIOMETRIC_SUCCESS) {
+      guard.reject(mapAvailability(status), availabilityMessage(status, authenticators))
+      return
     }
 
     // BiometricPrompt must be constructed and shown on the main thread. The
@@ -117,22 +140,410 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
           // the user's first fumble and leave the prompt orphaned on screen.
         }
 
-        val prompt = BiometricPrompt(
-          activity,
-          ContextCompat.getMainExecutor(activity),
-          callback
-        )
-        prompt.authenticate(buildPromptInfo(reason, authenticators))
+        BiometricPrompt(activity, ContextCompat.getMainExecutor(activity), callback)
+          .authenticate(buildPromptInfo(reason, authenticators))
       } catch (e: Exception) {
         guard.reject(CODE_UNKNOWN, e.message ?: "Failed to present the biometric prompt.")
       }
     }
   }
 
-  private fun buildPromptInfo(
+  // ---------------------------------------------------------------------------
+  // Secret storage
+  // ---------------------------------------------------------------------------
+
+  override fun storeSecret(
+    keyId: String,
+    secretHex: String,
+    policy: String,
+    invalidation: String,
+    promise: Promise
+  ) = storeSecretInto(keyId, secretHex, policy, invalidation, PromiseGuard(promise))
+
+  /**
+   * Note the platform asymmetry against iOS: there, encryption uses only the
+   * public half of an enclave keypair and needs no authentication. Android's
+   * wrapping key is symmetric AES-GCM, and `setUserAuthenticationRequired(true)`
+   * governs every use of it, so storing prompts too. Making storage silent here
+   * would mean dropping the auth requirement from the key entirely, which is
+   * the one property worth having.
+   */
+  private fun storeSecretInto(
+    keyId: String,
+    secretHex: String,
+    policy: String,
+    invalidation: String,
+    settler: Settler
+  ) {
+    val secret = WalletKeystoreCrypto.fromHex(secretHex)
+    if (secret == null) {
+      settler.reject(CODE_UNKNOWN, "`secretHex` must be a non-empty hex string.")
+      return
+    }
+
+    // Overwriting a wallet key has to be deliberate.
+    if (WalletKeystoreCrypto.hasRecord(reactApplicationContext, keyId) ||
+      WalletKeystoreCrypto.hasKey(keyId)
+    ) {
+      settler.reject(CODE_KEY_ALREADY_EXISTS, "A secret is already stored under this keyId.")
+      return
+    }
+
+    val generated = try {
+      WalletKeystoreCrypto.generateKey(keyId, policy, invalidation)
+    } catch (e: Exception) {
+      settler.reject(CODE_STORAGE_ERROR, e.message ?: "Could not create the wrapping key.")
+      return
+    }
+
+    val cipher = try {
+      WalletKeystoreCrypto.encryptCipher(generated.key)
+    } catch (e: Exception) {
+      WalletKeystoreCrypto.deleteKey(keyId)
+      settler.reject(classify(e), e.message ?: "Could not initialize encryption.")
+      return
+    }
+
+    if (policy == POLICY_NONE) {
+      finishStore(settler, keyId, secret, cipher)
+      return
+    }
+
+    withPrompt(
+      settler,
+      reason = "Store your wallet key",
+      policy = policy,
+      cipher = cipher,
+      onAuthenticated = { authenticated -> finishStore(settler, keyId, secret, authenticated) },
+      onSetupFailure = { WalletKeystoreCrypto.deleteKey(keyId) }
+    )
+  }
+
+  private fun finishStore(
+    settler: Settler,
+    keyId: String,
+    secret: ByteArray,
+    cipher: Cipher
+  ) {
+    try {
+      val ciphertext = cipher.doFinal(secret)
+      WalletKeystoreCrypto.writeRecord(reactApplicationContext, keyId, cipher.iv, ciphertext)
+      settler.resolve(null)
+    } catch (e: Exception) {
+      // Never leave a key behind with no ciphertext — the id would look taken
+      // forever and storeSecret would keep rejecting KEY_ALREADY_EXISTS.
+      WalletKeystoreCrypto.deleteKey(keyId)
+      WalletKeystoreCrypto.deleteRecord(reactApplicationContext, keyId)
+      settler.reject(classify(e), e.message ?: "Could not encrypt the secret.")
+    } finally {
+      secret.fill(0)
+    }
+  }
+
+  override fun getSecret(keyId: String, reason: String, promise: Promise) =
+    getSecretInto(keyId, reason, PromiseGuard(promise))
+
+  private fun getSecretInto(keyId: String, reason: String, settler: Settler) {
+    if (reason.isBlank()) {
+      settler.reject(CODE_UNKNOWN, "A non-empty `reason` is required to read a secret.")
+      return
+    }
+
+    val record = WalletKeystoreCrypto.readRecord(reactApplicationContext, keyId)
+    if (record == null) {
+      settler.reject(CODE_KEY_NOT_FOUND, "No secret is stored under this keyId.")
+      return
+    }
+    val (iv, ciphertext) = record
+
+    val key = try {
+      WalletKeystoreCrypto.loadKey(keyId)
+    } catch (e: Exception) {
+      settler.reject(classify(e), e.message ?: "Could not load the wrapping key.")
+      return
+    }
+
+    if (key == null) {
+      settler.reject(CODE_KEY_NOT_FOUND, "The wrapping key for this keyId is missing.")
+      return
+    }
+
+    // Cipher.init is where a key pinned to a changed biometric enrollment
+    // throws, so this is where KEY_INVALIDATED is detected.
+    val cipher = try {
+      WalletKeystoreCrypto.decryptCipher(key, iv)
+    } catch (e: Exception) {
+      settler.reject(classify(e), e.message ?: "The wrapping key is no longer usable.")
+      return
+    }
+
+    // Asked of the key rather than discovered by attempting the operation: a
+    // failed doFinal leaves the Cipher unusable, so it could not then be handed
+    // to the CryptoObject below.
+    if (!WalletKeystoreCrypto.requiresAuth(key)) {
+      try {
+        val plaintext = cipher.doFinal(ciphertext)
+        settler.resolve(WalletKeystoreCrypto.hex(plaintext))
+        plaintext.fill(0)
+      } catch (e: Exception) {
+        settler.reject(classify(e), e.message ?: "Could not decrypt the secret.")
+      }
+      return
+    }
+
+    // The CryptoObject is what makes this a real boundary rather than a check:
+    // the Cipher stays unusable until the OS validates the user, so a
+    // compromised JS bundle cannot skip it by faking a boolean.
+    withPrompt(
+      settler,
+      reason = reason,
+      policy = POLICY_BIOMETRIC_OR_PASSCODE,
+      cipher = cipher,
+      onAuthenticated = { authenticated ->
+        try {
+          val plaintext = authenticated.doFinal(ciphertext)
+          settler.resolve(WalletKeystoreCrypto.hex(plaintext))
+          plaintext.fill(0)
+        } catch (e: Exception) {
+          settler.reject(classify(e), e.message ?: "Could not decrypt the secret.")
+        }
+      }
+    )
+  }
+
+  override fun hasSecret(keyId: String, promise: Promise) {
+    promise.resolve(WalletKeystoreCrypto.hasRecord(reactApplicationContext, keyId))
+  }
+
+  override fun deleteSecret(keyId: String, promise: Promise) {
+    // Idempotent: a missing keyId is success for a teardown path.
+    WalletKeystoreCrypto.deleteRecord(reactApplicationContext, keyId)
+    WalletKeystoreCrypto.deletePublicKey(reactApplicationContext, keyId)
+    WalletKeystoreCrypto.deleteKey(keyId)
+    promise.resolve(null)
+  }
+
+  // ---------------------------------------------------------------------------
+  // secp256k1
+  // ---------------------------------------------------------------------------
+
+  override fun generateKey(
+    keyId: String,
+    policy: String,
+    invalidation: String,
+    promise: Promise
+  ) {
+    val guard = PromiseGuard(promise)
+
+    // Entropy from SecureRandom, never from JS. The private key goes straight
+    // into the wrapping path and never crosses the bridge.
+    val privateKey = try {
+      Secp256k1.generatePrivateKey()
+    } catch (e: Exception) {
+      guard.reject(CODE_STORAGE_ERROR, e.message ?: "Could not generate a key.")
+      return
+    }
+
+    wrapPrivateKey(keyId, privateKey, policy, invalidation, guard)
+  }
+
+  override fun importPrivateKey(
+    keyId: String,
+    privateKeyHex: String,
+    policy: String,
+    invalidation: String,
+    promise: Promise
+  ) {
+    val guard = PromiseGuard(promise)
+
+    val privateKey = WalletKeystoreCrypto.fromHex(privateKeyHex)
+    if (privateKey == null || privateKey.size != 32) {
+      guard.reject(CODE_INVALID_KEY, "A private key must be exactly 32 bytes of hex.")
+      return
+    }
+
+    // Zero and anything at or above the curve order are not merely malformed:
+    // they produce signatures that verify against nothing. Rejected, not clamped.
+    if (!Secp256k1.isValidPrivateKey(BigInteger(1, privateKey))) {
+      privateKey.fill(0)
+      guard.reject(CODE_INVALID_KEY, "The private key must be in [1, n-1].")
+      return
+    }
+
+    wrapPrivateKey(keyId, privateKey, policy, invalidation, guard)
+  }
+
+  /** Derives the public key, then stores the private key via the v0.2 path. */
+  private fun wrapPrivateKey(
+    keyId: String,
+    privateKey: ByteArray,
+    policy: String,
+    invalidation: String,
+    guard: Settler
+  ) {
+    val publicKeyHex = try {
+      WalletKeystoreCrypto.hex(Secp256k1.publicKeyFrom(privateKey))
+    } catch (e: Exception) {
+      privateKey.fill(0)
+      guard.reject(CODE_INVALID_KEY, e.message ?: "Could not derive the public key.")
+      return
+    }
+
+    val hex = WalletKeystoreCrypto.hex(privateKey)
+    privateKey.fill(0)
+
+    storeSecretInto(
+      keyId, hex, policy, invalidation,
+      Relay(
+        onResolve = {
+          // Recorded only after the wrapping succeeded, so a stored public key
+          // always implies a retrievable private one.
+          WalletKeystoreCrypto.writePublicKey(reactApplicationContext, keyId, publicKeyHex)
+          guard.resolve(publicKeyHex)
+        },
+        onReject = { code, message -> guard.reject(code, message) }
+      )
+    )
+  }
+
+  override fun getPublicKey(keyId: String, promise: Promise) {
+    val publicKey = WalletKeystoreCrypto.readPublicKey(reactApplicationContext, keyId)
+    if (publicKey == null) {
+      promise.reject(CODE_KEY_NOT_FOUND, "No key is stored under this keyId.")
+      return
+    }
+    promise.resolve(publicKey)
+  }
+
+  override fun signDigest(
+    keyId: String,
+    digestHex: String,
     reason: String,
-    authenticators: Int
-  ): BiometricPrompt.PromptInfo {
+    promise: Promise
+  ) {
+    val guard = PromiseGuard(promise)
+
+    val digest = WalletKeystoreCrypto.fromHex(digestHex)
+    if (digest == null || digest.size != 32) {
+      guard.reject(CODE_INVALID_KEY, "A digest must be exactly 32 bytes of hex.")
+      return
+    }
+
+    withUnwrappedKey(keyId, reason, guard) { privateKey ->
+      try {
+        guard.resolve(WalletKeystoreCrypto.hex(Secp256k1.sign(digest, privateKey)))
+      } catch (e: Exception) {
+        guard.reject(CODE_STORAGE_ERROR, e.message ?: "Could not sign the digest.")
+      }
+    }
+  }
+
+  override fun exportPrivateKey(keyId: String, reason: String, promise: Promise) {
+    val guard = PromiseGuard(promise)
+    withUnwrappedKey(keyId, reason, guard) { privateKey ->
+      guard.resolve(WalletKeystoreCrypto.hex(privateKey))
+    }
+  }
+
+  /**
+   * Authenticates, decrypts, hands over the raw key, then zeroes it.
+   *
+   * The zeroing is best-effort by nature — see the README. It shrinks the window
+   * in which the key sits in memory; in a managed runtime it cannot close it.
+   */
+  private fun withUnwrappedKey(
+    keyId: String,
+    reason: String,
+    guard: Settler,
+    use: (ByteArray) -> Unit
+  ) {
+    getSecretInto(
+      keyId, reason,
+      Relay(
+        onResolve = { value ->
+          val privateKey = (value as? String)?.let { WalletKeystoreCrypto.fromHex(it) }
+          if (privateKey == null) {
+            guard.reject(CODE_STORAGE_ERROR, "The stored key is missing or malformed.")
+          } else {
+            try {
+              use(privateKey)
+            } finally {
+              privateKey.fill(0)
+            }
+          }
+        },
+        onReject = { code, message -> guard.reject(code, message) }
+      )
+    )
+  }
+
+  // ---------------------------------------------------------------------------
+  // Prompt plumbing
+  // ---------------------------------------------------------------------------
+
+  /** Shared BiometricPrompt presentation for the crypto-bound operations. */
+  private fun withPrompt(
+    settler: Settler,
+    reason: String,
+    policy: String,
+    cipher: Cipher,
+    onAuthenticated: (Cipher) -> Unit,
+    onSetupFailure: () -> Unit = {}
+  ) {
+    val activity = reactApplicationContext.currentActivity
+    if (activity !is FragmentActivity) {
+      onSetupFailure()
+      settler.reject(
+        CODE_NOT_AVAILABLE,
+        "A foreground FragmentActivity is required to show the biometric prompt."
+      )
+      return
+    }
+
+    val authenticators = authenticatorsFor(policy)
+    val status = BiometricManager.from(reactApplicationContext).canAuthenticate(authenticators)
+    if (status != BiometricManager.BIOMETRIC_SUCCESS) {
+      onSetupFailure()
+      settler.reject(mapAvailability(status), availabilityMessage(status, authenticators))
+      return
+    }
+
+    UiThreadUtil.runOnUiThread {
+      try {
+        val callback = object : BiometricPrompt.AuthenticationCallback() {
+          override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+            // The Cipher handed back by the framework is the authenticated one.
+            val authenticated = result.cryptoObject?.cipher
+            if (authenticated == null) {
+              onSetupFailure()
+              settler.reject(CODE_UNKNOWN, "The authenticated cipher was not returned.")
+              return
+            }
+            onAuthenticated(authenticated)
+          }
+
+          override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+            onSetupFailure()
+            settler.reject(mapAuthError(errorCode), errString.toString())
+          }
+
+          // onAuthenticationFailed is intentionally not overridden — see
+          // authenticate() above.
+        }
+
+        BiometricPrompt(activity, ContextCompat.getMainExecutor(activity), callback)
+          .authenticate(
+            buildPromptInfo(reason, authenticators),
+            BiometricPrompt.CryptoObject(cipher)
+          )
+      } catch (e: Exception) {
+        onSetupFailure()
+        settler.reject(CODE_UNKNOWN, e.message ?: "Failed to present the biometric prompt.")
+      }
+    }
+  }
+
+  private fun buildPromptInfo(reason: String, authenticators: Int): BiometricPrompt.PromptInfo {
     val builder = BiometricPrompt.PromptInfo.Builder()
       .setTitle(reason)
       .setAllowedAuthenticators(authenticators)
@@ -206,252 +617,6 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
     else -> CODE_UNKNOWN
   }
 
-
-  // ---------------------------------------------------------------------------
-  // Secret storage
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Note the platform asymmetry against iOS: there, encryption uses only the
-   * public half of an enclave keypair and needs no authentication. Android's
-   * wrapping key is symmetric AES-GCM, and `setUserAuthenticationRequired(true)`
-   * governs every use of it, so storing prompts too. Making storage silent here
-   * would mean dropping the auth requirement from the key entirely, which is
-   * the one property worth having.
-   */
-  override fun storeSecret(
-    keyId: String,
-    secretHex: String,
-    policy: String,
-    invalidation: String,
-    promise: Promise
-  ) {
-    val guard = PromiseGuard(promise)
-
-    val secret = WalletKeystoreCrypto.fromHex(secretHex)
-    if (secret == null) {
-      guard.reject(CODE_UNKNOWN, "`secretHex` must be a non-empty hex string.")
-      return
-    }
-
-    // Overwriting a wallet key has to be deliberate.
-    if (WalletKeystoreCrypto.hasRecord(reactApplicationContext, keyId) ||
-      WalletKeystoreCrypto.hasKey(keyId)
-    ) {
-      guard.reject(CODE_KEY_ALREADY_EXISTS, "A secret is already stored under this keyId.")
-      return
-    }
-
-    val generated = try {
-      WalletKeystoreCrypto.generateKey(keyId, policy, invalidation)
-    } catch (e: Exception) {
-      guard.reject(CODE_STORAGE_ERROR, e.message ?: "Could not create the wrapping key.")
-      return
-    }
-
-    val cipher = try {
-      WalletKeystoreCrypto.encryptCipher(generated.key)
-    } catch (e: Exception) {
-      WalletKeystoreCrypto.deleteKey(keyId)
-      guard.reject(classify(e), e.message ?: "Could not initialize encryption.")
-      return
-    }
-
-    if (policy == POLICY_NONE) {
-      finishStore(guard, keyId, secret, cipher)
-      return
-    }
-
-    withPrompt(
-      guard,
-      reason = "Store your wallet key",
-      policy = policy,
-      cipher = cipher,
-      onAuthenticated = { authenticated ->
-        finishStore(guard, keyId, secret, authenticated)
-      },
-      onSetupFailure = { WalletKeystoreCrypto.deleteKey(keyId) }
-    )
-  }
-
-  private fun finishStore(
-    guard: PromiseGuard,
-    keyId: String,
-    secret: ByteArray,
-    cipher: Cipher
-  ) {
-    try {
-      val ciphertext = cipher.doFinal(secret)
-      WalletKeystoreCrypto.writeRecord(
-        reactApplicationContext,
-        keyId,
-        cipher.iv,
-        ciphertext
-      )
-      guard.resolve(null)
-    } catch (e: Exception) {
-      // Never leave a key behind with no ciphertext — the id would look taken
-      // forever and storeSecret would keep rejecting KEY_ALREADY_EXISTS.
-      WalletKeystoreCrypto.deleteKey(keyId)
-      WalletKeystoreCrypto.deleteRecord(reactApplicationContext, keyId)
-      guard.reject(classify(e), e.message ?: "Could not encrypt the secret.")
-    } finally {
-      secret.fill(0)
-    }
-  }
-
-  override fun getSecret(keyId: String, reason: String, promise: Promise) {
-    val guard = PromiseGuard(promise)
-
-    if (reason.isBlank()) {
-      guard.reject(CODE_UNKNOWN, "A non-empty `reason` is required to read a secret.")
-      return
-    }
-
-    val record = WalletKeystoreCrypto.readRecord(reactApplicationContext, keyId)
-    if (record == null) {
-      guard.reject(CODE_KEY_NOT_FOUND, "No secret is stored under this keyId.")
-      return
-    }
-    val (iv, ciphertext) = record
-
-    val key = try {
-      WalletKeystoreCrypto.loadKey(keyId)
-    } catch (e: Exception) {
-      guard.reject(classify(e), e.message ?: "Could not load the wrapping key.")
-      return
-    }
-
-    if (key == null) {
-      guard.reject(CODE_KEY_NOT_FOUND, "The wrapping key for this keyId is missing.")
-      return
-    }
-
-    // Cipher.init is where a key pinned to a changed biometric enrollment
-    // throws, so this is where KEY_INVALIDATED is detected.
-    val cipher = try {
-      WalletKeystoreCrypto.decryptCipher(key, iv)
-    } catch (e: Exception) {
-      guard.reject(classify(e), e.message ?: "The wrapping key is no longer usable.")
-      return
-    }
-
-    // Asked of the key rather than discovered by attempting the operation: a
-    // failed doFinal leaves the Cipher unusable, so it could not then be handed
-    // to the CryptoObject below.
-    if (!WalletKeystoreCrypto.requiresAuth(key)) {
-      try {
-        val plaintext = cipher.doFinal(ciphertext)
-        guard.resolve(WalletKeystoreCrypto.hex(plaintext))
-        plaintext.fill(0)
-      } catch (e: Exception) {
-        guard.reject(classify(e), e.message ?: "Could not decrypt the secret.")
-      }
-      return
-    }
-
-    // The CryptoObject is what makes this a real boundary rather than a check:
-    // the Cipher stays unusable until the OS validates the user, so a
-    // compromised JS bundle cannot skip it by faking a boolean.
-    withPrompt(
-      guard,
-      reason = reason,
-      policy = inferPolicy(),
-      cipher = cipher,
-      onAuthenticated = { authenticated ->
-        try {
-          val plaintext = authenticated.doFinal(ciphertext)
-          guard.resolve(WalletKeystoreCrypto.hex(plaintext))
-          plaintext.fill(0)
-        } catch (e: Exception) {
-          guard.reject(classify(e), e.message ?: "Could not decrypt the secret.")
-        }
-      }
-    )
-  }
-
-  override fun hasSecret(keyId: String, promise: Promise) {
-    promise.resolve(WalletKeystoreCrypto.hasRecord(reactApplicationContext, keyId))
-  }
-
-  override fun deleteSecret(keyId: String, promise: Promise) {
-    // Idempotent: a missing keyId is success for a teardown path.
-    WalletKeystoreCrypto.deleteRecord(reactApplicationContext, keyId)
-    WalletKeystoreCrypto.deleteKey(keyId)
-    promise.resolve(null)
-  }
-
-  /**
-   * The key already encodes which authenticators it accepts, and the prompt
-   * only has to be permissive enough to satisfy it. Asking for both is correct
-   * for a key that accepts either and harmless for one that does not, since the
-   * Keystore — not the prompt — is the thing enforcing the constraint.
-   */
-  private fun inferPolicy(): String = "biometricOrPasscode"
-
-  /** Shared BiometricPrompt presentation for the crypto-bound operations. */
-  private fun withPrompt(
-    guard: PromiseGuard,
-    reason: String,
-    policy: String,
-    cipher: Cipher,
-    onAuthenticated: (Cipher) -> Unit,
-    onSetupFailure: () -> Unit = {}
-  ) {
-    val activity = reactApplicationContext.currentActivity
-    if (activity !is FragmentActivity) {
-      onSetupFailure()
-      guard.reject(
-        CODE_NOT_AVAILABLE,
-        "A foreground FragmentActivity is required to show the biometric prompt."
-      )
-      return
-    }
-
-    val authenticators = authenticatorsFor(policy)
-
-    val status = BiometricManager.from(reactApplicationContext).canAuthenticate(authenticators)
-    if (status != BiometricManager.BIOMETRIC_SUCCESS) {
-      onSetupFailure()
-      guard.reject(mapAvailability(status), availabilityMessage(status, authenticators))
-      return
-    }
-
-    UiThreadUtil.runOnUiThread {
-      try {
-        val callback = object : BiometricPrompt.AuthenticationCallback() {
-          override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
-            // The Cipher handed back by the framework is the authenticated one.
-            val authenticated = result.cryptoObject?.cipher
-            if (authenticated == null) {
-              onSetupFailure()
-              guard.reject(CODE_UNKNOWN, "The authenticated cipher was not returned.")
-              return
-            }
-            onAuthenticated(authenticated)
-          }
-
-          override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
-            onSetupFailure()
-            guard.reject(mapAuthError(errorCode), errString.toString())
-          }
-
-          // onAuthenticationFailed is intentionally not overridden — see
-          // authenticate() above.
-        }
-
-        BiometricPrompt(activity, ContextCompat.getMainExecutor(activity), callback)
-          .authenticate(
-            buildPromptInfo(reason, authenticators),
-            BiometricPrompt.CryptoObject(cipher)
-          )
-      } catch (e: Exception) {
-        onSetupFailure()
-        guard.reject(CODE_UNKNOWN, e.message ?: "Failed to present the biometric prompt.")
-      }
-    }
-  }
-
   private fun classify(t: Throwable): String = when {
     WalletKeystoreCrypto.isInvalidated(t) -> CODE_KEY_INVALIDATED
     WalletKeystoreCrypto.isNotAuthenticated(t) -> CODE_NOT_ENROLLED
@@ -462,6 +627,7 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
     const val NAME = NativeWalletKeystoreSpec.NAME
 
     internal const val POLICY_BIOMETRIC_ONLY = "biometricOnly"
+    internal const val POLICY_BIOMETRIC_OR_PASSCODE = "biometricOrPasscode"
     internal const val POLICY_NONE = "none"
     internal const val INVALIDATION_ON_ENROLLMENT_CHANGE = "onEnrollmentChange"
 
@@ -476,5 +642,6 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
     private const val CODE_KEY_ALREADY_EXISTS = "KEY_ALREADY_EXISTS"
     private const val CODE_KEY_INVALIDATED = "KEY_INVALIDATED"
     private const val CODE_STORAGE_ERROR = "STORAGE_ERROR"
+    private const val CODE_INVALID_KEY = "INVALID_KEY"
   }
 }

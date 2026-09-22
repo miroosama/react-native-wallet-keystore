@@ -51,6 +51,45 @@ export interface Spec extends TurboModule {
 
   /** Idempotent: deleting an absent `keyId` resolves rather than rejecting. */
   deleteSecret(keyId: string): Promise<void>;
+
+  /**
+   * Generates a secp256k1 keypair and stores the private key under the same
+   * hardware-wrapping path as `storeSecret`. Resolves the uncompressed public
+   * key as hex.
+   *
+   * Entropy comes from the platform CSPRNG, never from JS, and the private key
+   * never crosses the bridge during generation.
+   */
+  generateKey(
+    keyId: string,
+    policy: string,
+    invalidation: string
+  ): Promise<string>;
+
+  /** Imports an existing key. Rejects `INVALID_KEY` unless it is in [1, n-1]. */
+  importPrivateKey(
+    keyId: string,
+    privateKeyHex: string,
+    policy: string,
+    invalidation: string
+  ): Promise<string>;
+
+  /**
+   * The uncompressed public key. Deliberately requires no authentication —
+   * it is not secret, and prompting to see your own address is hostile.
+   */
+  getPublicKey(keyId: string): Promise<string>;
+
+  /**
+   * Signs a 32-byte digest, returning 65 bytes as `r || s || v` hex.
+   *
+   * `s` is low-s normalized per EIP-2 and `v` is 27/28, so the result is
+   * byte-identical to what viem produces for the same key and digest.
+   */
+  signDigest(keyId: string, digestHex: string, reason: string): Promise<string>;
+
+  /** Backup/export path. Authenticates, then surfaces the key to JS. */
+  exportPrivateKey(keyId: string, reason: string): Promise<string>;
 }
 
 export default TurboModuleRegistry.getEnforcing<Spec>('WalletKeystore');

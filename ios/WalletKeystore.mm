@@ -3,6 +3,9 @@
 #import <LocalAuthentication/LocalAuthentication.h>
 #import <Security/Security.h>
 
+#import <secp256k1.h>
+#import <secp256k1_recovery.h>
+
 static NSString *const WKPolicyBiometricOnly = @"biometricOnly";
 static NSString *const WKPolicyNone = @"none";
 static NSString *const WKInvalidationOnEnrollmentChange = @"onEnrollmentChange";
@@ -19,8 +22,56 @@ static NSString *const WKCodeKeyInvalidated = @"KEY_INVALIDATED";
 static NSString *const WKCodeStorageError = @"STORAGE_ERROR";
 static NSString *const WKCodeUnknown = @"UNKNOWN";
 
+static NSString *const WKCodeInvalidKey = @"INVALID_KEY";
+
 static NSString *const WKKeychainService = @"com.walletkeystore.secret";
+static NSString *const WKPublicKeyService = @"com.walletkeystore.publickey";
 static NSString *const WKKeyTagPrefix = @"com.walletkeystore.wrap.";
+
+/**
+ * Zeroes a buffer in a way the optimizer cannot discard.
+ *
+ * A plain memset over memory that is never read again is dead-store-eliminated
+ * at -O3, leaving the key in place. Writing through a volatile pointer forces
+ * the stores. (memset_s would also work but requires __STDC_WANT_LIB_EXT1__,
+ * which is not reliably set across the toolchains this gets built with.)
+ */
+static void WKSecureZero(void *buffer, size_t length)
+{
+  if (buffer == NULL || length == 0) {
+    return;
+  }
+  volatile unsigned char *p = (volatile unsigned char *)buffer;
+  while (length--) {
+    *p++ = 0;
+  }
+}
+
+/**
+ * Shared libsecp256k1 context.
+ *
+ * Creating one is expensive (it builds precomputation tables), and the library
+ * documents the context as safe for concurrent use once randomized. It is
+ * randomized at creation to blind against side-channel recovery of the key
+ * during signing.
+ */
+static secp256k1_context *WKSecpContext(void)
+{
+  static secp256k1_context *context = NULL;
+  static dispatch_once_t onceToken;
+  dispatch_once(&onceToken, ^{
+    context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    uint8_t seed[32];
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(seed), seed) == errSecSuccess) {
+      // Blinding is a hardening measure, not a correctness requirement — if it
+      // fails the context is still usable, so the result is deliberately
+      // tolerated rather than treated as fatal.
+      (void)secp256k1_context_randomize(context, seed);
+    }
+    WKSecureZero(seed, sizeof(seed));
+  });
+  return context;
+}
 
 @implementation WalletKeystore
 
@@ -232,6 +283,15 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
   };
 }
 
+static NSDictionary *WKPublicKeyQuery(NSString *keyId)
+{
+  return @{
+    (__bridge id)kSecClass : (__bridge id)kSecClassGenericPassword,
+    (__bridge id)kSecAttrService : WKPublicKeyService,
+    (__bridge id)kSecAttrAccount : keyId,
+  };
+}
+
 #pragma mark - v0.1 authentication
 
 - (void)getBiometryType:(RCTPromiseResolveBlock)resolve
@@ -333,9 +393,31 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
             resolve:(RCTPromiseResolveBlock)resolve
              reject:(RCTPromiseRejectBlock)reject
 {
+  [self storeSecretInternal:keyId
+                  secretHex:secretHex
+                     policy:policy
+               invalidation:invalidation
+                  onSuccess:^{ resolve(nil); }
+                    onError:^(NSString *code, NSString *message) {
+                      reject(code, message, nil);
+                    }];
+}
+
+/**
+ * Reused by generateKey and importPrivateKey, which need the outcome rather
+ * than a settled promise. Reporting through blocks keeps one copy of the
+ * wrapping logic instead of two that can drift.
+ */
+- (void)storeSecretInternal:(NSString *)keyId
+                  secretHex:(NSString *)secretHex
+                     policy:(NSString *)policy
+               invalidation:(NSString *)invalidation
+                  onSuccess:(void (^)(void))onSuccess
+                    onError:(void (^)(NSString *code, NSString *message))onError
+{
   NSData *secret = WKDataFromHex(secretHex);
   if (secret == nil || secret.length == 0) {
-    reject(WKCodeUnknown, @"`secretHex` must be a non-empty hex string.", nil);
+    onError(WKCodeUnknown, @"`secretHex` must be a non-empty hex string.");
     return;
   }
 
@@ -345,8 +427,7 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
   SecKeyRef existingKey = WKCopyPrivateKey(keyId, nil, &existing);
   if (existingKey != NULL) {
     CFRelease(existingKey);
-    reject(WKCodeKeyAlreadyExists,
-           @"A secret is already stored under this keyId.", nil);
+    onError(WKCodeKeyAlreadyExists, @"A secret is already stored under this keyId.");
     return;
   }
 
@@ -359,9 +440,8 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
 
   if (access == NULL) {
     NSError *error = CFBridgingRelease(acError);
-    reject(WKCodeFromSecError(error),
-           error.localizedDescription ?: @"Could not build access control.",
-           error);
+    onError(WKCodeFromSecError(error),
+            error.localizedDescription ?: @"Could not build access control.");
     return;
   }
 
@@ -383,9 +463,8 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
 
   if (privateKey == NULL) {
     NSError *error = CFBridgingRelease(keyError);
-    reject(WKCodeFromSecError(error),
-           error.localizedDescription ?: @"Could not create the wrapping key.",
-           error);
+    onError(WKCodeFromSecError(error),
+            error.localizedDescription ?: @"Could not create the wrapping key.");
     return;
   }
 
@@ -394,7 +473,7 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
 
   if (publicKey == NULL) {
     [self deleteKeyMaterial:keyId];
-    reject(WKCodeStorageError, @"Could not derive the wrapping public key.", nil);
+    onError(WKCodeStorageError, @"Could not derive the wrapping public key.");
     return;
   }
 
@@ -411,9 +490,8 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
   if (ciphertext == nil) {
     NSError *error = CFBridgingRelease(encryptError);
     [self deleteKeyMaterial:keyId];
-    reject(WKCodeFromSecError(error),
-           error.localizedDescription ?: @"Could not encrypt the secret.",
-           error);
+    onError(WKCodeFromSecError(error),
+            error.localizedDescription ?: @"Could not encrypt the secret.");
     return;
   }
 
@@ -431,20 +509,40 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
     // Leaving an enclave key behind with no ciphertext would make the id look
     // taken forever, so roll it back.
     [self deleteKeyMaterial:keyId];
-    reject(WKCodeFromOSStatus(addStatus),
-           [NSString stringWithFormat:@"Could not store the ciphertext (%d).",
-                                      (int)addStatus],
-           nil);
+    onError(WKCodeFromOSStatus(addStatus),
+            [NSString stringWithFormat:@"Could not store the ciphertext (%d).",
+                                       (int)addStatus]);
     return;
   }
 
-  resolve(nil);
+  onSuccess();
 }
 
 - (void)getSecret:(NSString *)keyId
            reason:(NSString *)reason
           resolve:(RCTPromiseResolveBlock)resolve
            reject:(RCTPromiseRejectBlock)reject
+{
+  [self getSecretInternal:keyId
+                   reason:reason
+                onSuccess:^(NSData *plaintext) {
+                  NSString *hex = WKHexFromData(plaintext);
+                  resolve(hex);
+                }
+                  onError:^(NSString *code, NSString *message) {
+                    reject(code, message, nil);
+                  }];
+}
+
+/**
+ * Hands back raw bytes rather than hex so signDigest never materializes the
+ * key as an NSString, which is immutable and cannot be wiped. The buffer is
+ * zeroed once the caller's block returns.
+ */
+- (void)getSecretInternal:(NSString *)keyId
+                   reason:(NSString *)reason
+                onSuccess:(void (^)(NSData *plaintext))onSuccess
+                  onError:(void (^)(NSString *code, NSString *message))onError
 {
   NSMutableDictionary *query = [WKCiphertextQuery(keyId) mutableCopy];
   query[(__bridge id)kSecReturnData] = @YES;
@@ -454,11 +552,10 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
       SecItemCopyMatching((__bridge CFDictionaryRef)query, &stored);
 
   if (readStatus != errSecSuccess) {
-    reject(WKCodeFromOSStatus(readStatus),
-           readStatus == errSecItemNotFound
-               ? @"No secret is stored under this keyId."
-               : @"Could not read the stored ciphertext.",
-           nil);
+    onError(WKCodeFromOSStatus(readStatus),
+            readStatus == errSecItemNotFound
+                ? @"No secret is stored under this keyId."
+                : @"Could not read the stored ciphertext.");
     return;
   }
 
@@ -475,11 +572,10 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
     SecKeyRef privateKey = WKCopyPrivateKey(keyId, context, &keyStatus);
 
     if (privateKey == NULL) {
-      reject(WKCodeFromOSStatus(keyStatus),
-             keyStatus == errSecItemNotFound
-                 ? @"The wrapping key for this keyId is missing."
-                 : @"Could not load the wrapping key.",
-             nil);
+      onError(WKCodeFromOSStatus(keyStatus),
+              keyStatus == errSecItemNotFound
+                  ? @"The wrapping key for this keyId is missing."
+                  : @"Could not load the wrapping key.");
       return;
     }
 
@@ -493,20 +589,16 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
 
     if (plaintext == nil) {
       NSError *error = CFBridgingRelease(decryptError);
-      reject(WKCodeFromSecError(error),
-             error.localizedDescription ?: @"Could not decrypt the secret.",
-             error);
+      onError(WKCodeFromSecError(error),
+              error.localizedDescription ?: @"Could not decrypt the secret.");
       return;
     }
 
-    NSString *hex = WKHexFromData(plaintext);
+    onSuccess(plaintext);
 
-    // Best effort only. The NSData buffer is zeroed here, but the NSString
-    // above is already immutable and heap-allocated, and the JS string it
-    // becomes cannot be zeroed at all. This is why signDigest will exist.
-    memset((void *)plaintext.bytes, 0, plaintext.length);
-
-    resolve(hex);
+    // Best effort only, and only over the buffer we own. Anything the callback
+    // derived — an NSString, or the JS string it becomes — cannot be wiped.
+    WKSecureZero((void *)plaintext.bytes, plaintext.length);
   });
 }
 
@@ -529,6 +621,7 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
 {
   // Idempotent: errSecItemNotFound is success for a teardown path.
   SecItemDelete((__bridge CFDictionaryRef)WKCiphertextQuery(keyId));
+  SecItemDelete((__bridge CFDictionaryRef)WKPublicKeyQuery(keyId));
   [self deleteKeyMaterial:keyId];
   resolve(nil);
 }
@@ -541,6 +634,225 @@ static NSDictionary *WKCiphertextQuery(NSString *keyId)
     (__bridge id)kSecAttrKeyType : (__bridge id)kSecAttrKeyTypeECSECPrimeRandom,
   };
   SecItemDelete((__bridge CFDictionaryRef)query);
+}
+
+
+#pragma mark - v0.3 secp256k1
+
+/** Uncompressed SEC1: 0x04 || X || Y, 65 bytes. */
+static NSData *_Nullable WKPublicKeyFromPrivate(NSData *privateKey)
+{
+  secp256k1_context *ctx = WKSecpContext();
+  secp256k1_pubkey pubkey;
+
+  if (!secp256k1_ec_pubkey_create(ctx, &pubkey, (const unsigned char *)privateKey.bytes)) {
+    return nil;
+  }
+
+  uint8_t serialized[65];
+  size_t length = sizeof(serialized);
+  if (!secp256k1_ec_pubkey_serialize(ctx, serialized, &length, &pubkey,
+                                     SECP256K1_EC_UNCOMPRESSED)) {
+    return nil;
+  }
+
+  return [NSData dataWithBytes:serialized length:length];
+}
+
+- (void)persistPublicKey:(NSData *)publicKey forKeyId:(NSString *)keyId
+{
+  NSMutableDictionary *item = [WKPublicKeyQuery(keyId) mutableCopy];
+  item[(__bridge id)kSecValueData] = publicKey;
+  // No access control: a public key is not secret, and prompting to read your
+  // own address would be hostile. Device-only so it does not sync.
+  item[(__bridge id)kSecAttrAccessible] =
+      (__bridge id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
+
+  SecItemDelete((__bridge CFDictionaryRef)WKPublicKeyQuery(keyId));
+  SecItemAdd((__bridge CFDictionaryRef)item, NULL);
+}
+
+/** Shared tail of generateKey and importPrivateKey. */
+- (void)wrapPrivateKey:(NSData *)privateKey
+                 keyId:(NSString *)keyId
+                policy:(NSString *)policy
+          invalidation:(NSString *)invalidation
+               resolve:(RCTPromiseResolveBlock)resolve
+                reject:(RCTPromiseRejectBlock)reject
+{
+  NSData *publicKey = WKPublicKeyFromPrivate(privateKey);
+  if (publicKey == nil) {
+    reject(WKCodeInvalidKey, @"Could not derive a public key from this private key.", nil);
+    return;
+  }
+
+  NSString *secretHex = WKHexFromData(privateKey);
+  NSString *publicKeyHex = WKHexFromData(publicKey);
+
+  [self storeSecretInternal:keyId
+                  secretHex:secretHex
+                     policy:policy
+               invalidation:invalidation
+                  onSuccess:^{
+                    // Recorded only after wrapping succeeded, so a stored
+                    // public key always implies a retrievable private one.
+                    [self persistPublicKey:publicKey forKeyId:keyId];
+                    resolve(publicKeyHex);
+                  }
+                    onError:^(NSString *code, NSString *message) {
+                      reject(code, message, nil);
+                    }];
+}
+
+- (void)generateKey:(NSString *)keyId
+             policy:(NSString *)policy
+       invalidation:(NSString *)invalidation
+            resolve:(RCTPromiseResolveBlock)resolve
+             reject:(RCTPromiseRejectBlock)reject
+{
+  secp256k1_context *ctx = WKSecpContext();
+  uint8_t seckey[32];
+
+  // Rejection sampling against the curve order rather than reduction, which
+  // would bias the distribution toward small keys. Entropy is the platform
+  // CSPRNG — never JS, whose PRNG is not cryptographically secure.
+  BOOL valid = NO;
+  for (int attempt = 0; attempt < 256 && !valid; attempt++) {
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(seckey), seckey) != errSecSuccess) {
+      WKSecureZero(seckey, sizeof(seckey));
+      reject(WKCodeStorageError, @"The system random number generator failed.", nil);
+      return;
+    }
+    valid = secp256k1_ec_seckey_verify(ctx, seckey) == 1;
+  }
+
+  if (!valid) {
+    WKSecureZero(seckey, sizeof(seckey));
+    reject(WKCodeStorageError, @"Could not generate a valid private key.", nil);
+    return;
+  }
+
+  NSData *privateKey = [NSData dataWithBytes:seckey length:sizeof(seckey)];
+  WKSecureZero(seckey, sizeof(seckey));
+
+  [self wrapPrivateKey:privateKey
+                 keyId:keyId
+                policy:policy
+          invalidation:invalidation
+               resolve:resolve
+                reject:reject];
+}
+
+- (void)importPrivateKey:(NSString *)keyId
+           privateKeyHex:(NSString *)privateKeyHex
+                  policy:(NSString *)policy
+            invalidation:(NSString *)invalidation
+                 resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject
+{
+  NSData *privateKey = WKDataFromHex(privateKeyHex);
+  if (privateKey == nil || privateKey.length != 32) {
+    reject(WKCodeInvalidKey, @"A private key must be exactly 32 bytes of hex.", nil);
+    return;
+  }
+
+  // Zero and anything at or above the curve order are not merely malformed —
+  // they yield signatures that verify against nothing. Rejected, not clamped.
+  if (secp256k1_ec_seckey_verify(WKSecpContext(), (const unsigned char *)privateKey.bytes) != 1) {
+    reject(WKCodeInvalidKey, @"The private key must be in [1, n-1].", nil);
+    return;
+  }
+
+  [self wrapPrivateKey:privateKey
+                 keyId:keyId
+                policy:policy
+          invalidation:invalidation
+               resolve:resolve
+                reject:reject];
+}
+
+- (void)getPublicKey:(NSString *)keyId
+             resolve:(RCTPromiseResolveBlock)resolve
+              reject:(RCTPromiseRejectBlock)reject
+{
+  NSMutableDictionary *query = [WKPublicKeyQuery(keyId) mutableCopy];
+  query[(__bridge id)kSecReturnData] = @YES;
+
+  CFTypeRef stored = NULL;
+  OSStatus status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &stored);
+
+  if (status != errSecSuccess) {
+    reject(WKCodeKeyNotFound, @"No key is stored under this keyId.", nil);
+    return;
+  }
+
+  resolve(WKHexFromData(CFBridgingRelease(stored)));
+}
+
+- (void)signDigest:(NSString *)keyId
+         digestHex:(NSString *)digestHex
+            reason:(NSString *)reason
+           resolve:(RCTPromiseResolveBlock)resolve
+            reject:(RCTPromiseRejectBlock)reject
+{
+  NSData *digest = WKDataFromHex(digestHex);
+  if (digest == nil || digest.length != 32) {
+    reject(WKCodeInvalidKey, @"A digest must be exactly 32 bytes of hex.", nil);
+    return;
+  }
+
+  [self getSecretInternal:keyId
+                   reason:reason
+                onSuccess:^(NSData *privateKey) {
+                  secp256k1_context *ctx = WKSecpContext();
+                  secp256k1_ecdsa_recoverable_signature signature;
+
+                  // The nonce is RFC 6979 deterministic by default. A repeated
+                  // or predictable nonce reveals the private key algebraically,
+                  // so this must never be supplied by hand.
+                  if (!secp256k1_ecdsa_sign_recoverable(
+                          ctx, &signature,
+                          (const unsigned char *)digest.bytes,
+                          (const unsigned char *)privateKey.bytes, NULL, NULL)) {
+                    reject(WKCodeStorageError, @"Could not sign the digest.", nil);
+                    return;
+                  }
+
+                  uint8_t compact[64];
+                  int recid = 0;
+                  secp256k1_ecdsa_recoverable_signature_serialize_compact(
+                      ctx, compact, &recid, &signature);
+
+                  // libsecp256k1 already emits the low-s form required by
+                  // EIP-2, negating s and flipping recid when needed, so no
+                  // separate normalization step is correct here.
+                  uint8_t result[65];
+                  memcpy(result, compact, 64);
+                  result[64] = (uint8_t)(recid + 27);
+
+                  NSData *serialized = [NSData dataWithBytes:result length:sizeof(result)];
+                  WKSecureZero(compact, sizeof(compact));
+
+                  resolve(WKHexFromData(serialized));
+                }
+                  onError:^(NSString *code, NSString *message) {
+                    reject(code, message, nil);
+                  }];
+}
+
+- (void)exportPrivateKey:(NSString *)keyId
+                  reason:(NSString *)reason
+                 resolve:(RCTPromiseResolveBlock)resolve
+                  reject:(RCTPromiseRejectBlock)reject
+{
+  [self getSecretInternal:keyId
+                   reason:reason
+                onSuccess:^(NSData *privateKey) {
+                  resolve(WKHexFromData(privateKey));
+                }
+                  onError:^(NSString *code, NSString *message) {
+                    reject(code, message, nil);
+                  }];
 }
 
 #pragma mark - TurboModule

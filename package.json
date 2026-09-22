@@ -10,6 +10,11 @@
       "types": "./lib/typescript/src/index.d.ts",
       "default": "./lib/module/index.js"
     },
+    "./viem": {
+      "react-native-wallet-keystore-source": "./src/viem.ts",
+      "types": "./lib/typescript/src/viem.d.ts",
+      "default": "./lib/module/viem.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
@@ -86,11 +91,13 @@
     "react-native-web": "~0.21.2",
     "release-it": "^21.0.1",
     "turbo": "^2.10.8",
-    "typescript": "^6.0.3"
+    "typescript": "^6.0.3",
+    "viem": "^2.56.8"
   },
   "peerDependencies": {
     "react": "*",
-    "react-native": "*"
+    "react-native": "*",
+    "viem": ">=2.0.0"
   },
   "workspaces": [
     "example"
@@ -181,5 +188,10 @@
       "vite"
     ],
     "version": "0.63.1"
+  },
+  "peerDependenciesMeta": {
+    "viem": {
+      "optional": true
+    }
   }
 }

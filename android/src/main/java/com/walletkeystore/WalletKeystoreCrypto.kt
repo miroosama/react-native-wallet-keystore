@@ -29,6 +29,7 @@ internal object WalletKeystoreCrypto {
   const val GCM_TAG_BITS = 128
   private const val PREFS = "com.walletkeystore.secrets"
   private const val KEY_PREFIX = "com.walletkeystore.wrap."
+  private const val PUBLIC_KEY_PREFIX = "pub:"
 
   fun alias(keyId: String) = KEY_PREFIX + keyId
 
@@ -60,6 +61,20 @@ internal object WalletKeystoreCrypto {
   }
 
   fun hasRecord(context: Context, keyId: String) = prefs(context).contains(keyId)
+
+  // The public key is stored in the clear, deliberately. Deriving it requires
+  // the private key, and nobody should face a biometric prompt to look up their
+  // own address.
+  fun writePublicKey(context: Context, keyId: String, publicKeyHex: String) {
+    prefs(context).edit().putString(PUBLIC_KEY_PREFIX + keyId, publicKeyHex).apply()
+  }
+
+  fun readPublicKey(context: Context, keyId: String): String? =
+    prefs(context).getString(PUBLIC_KEY_PREFIX + keyId, null)
+
+  fun deletePublicKey(context: Context, keyId: String) {
+    prefs(context).edit().remove(PUBLIC_KEY_PREFIX + keyId).apply()
+  }
 
   fun keyStore(): KeyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
 

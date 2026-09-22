@@ -23,6 +23,8 @@ export type KeystoreErrorCode =
    */
   | 'KEY_INVALIDATED'
   | 'STORAGE_ERROR'
+  /** A private key outside [1, n-1], or a digest that is not 32 bytes. */
+  | 'INVALID_KEY'
   | 'UNKNOWN';
 
 const KNOWN_CODES: ReadonlySet<string> = new Set<KeystoreErrorCode>([
@@ -37,6 +39,7 @@ const KNOWN_CODES: ReadonlySet<string> = new Set<KeystoreErrorCode>([
   'KEY_ALREADY_EXISTS',
   'KEY_INVALIDATED',
   'STORAGE_ERROR',
+  'INVALID_KEY',
   'UNKNOWN',
 ]);
 
