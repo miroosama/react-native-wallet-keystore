@@ -95,6 +95,9 @@
   "workspaces": [
     "example"
   ],
+  "engines": {
+    "node": ">=22.12"
+  },
   "packageManager": "yarn@4.11.0",
   "react-native-builder-bob": {
     "source": "src",
@@ -135,7 +138,7 @@
       "customExportConditions": [
         "require",
         "react-native",
-        "<%- project.sourceCondition -%>"
+        "react-native-wallet-keystore-source"
       ]
     },
     "modulePathIgnorePatterns": [

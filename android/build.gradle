@@ -52,4 +52,7 @@ android {
 
 dependencies {
   implementation "com.facebook.react:react-android"
+
+  // BiometricPrompt, plus the FragmentActivity it requires as a host.
+  implementation "androidx.biometric:biometric:1.1.0"
 }
