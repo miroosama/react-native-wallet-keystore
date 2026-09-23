@@ -14,11 +14,9 @@ import java.math.BigInteger
 import java.security.SecureRandom
 
 /**
- * secp256k1 signing with Ethereum's conventions.
- *
- * iOS uses libsecp256k1, which supplies the recovery id directly. BouncyCastle
- * does not, so it is derived here. The known-answer vectors are what keep the
- * two implementations from diverging.
+ * secp256k1 signing with Ethereum's conventions. libsecp256k1 gives iOS the
+ * recovery id directly; BouncyCastle does not, so it is derived here. The
+ * known-answer vectors are what keep the two from diverging.
  */
 internal object Secp256k1 {
 
@@ -55,11 +53,10 @@ internal object Secp256k1 {
   }
 
   /**
-   * Signs a 32-byte digest, returning 65 bytes as r || s || v with v in 27/28.
+   * Signs a 32-byte digest into 65 bytes: r || s || v, with v in 27/28.
    *
-   * RFC 6979 deterministic nonces come from HMacDSAKCalculator. A random nonce
-   * that repeats across two signatures reveals the private key algebraically,
-   * so this must never be hand-rolled.
+   * RFC 6979 nonces come from HMacDSAKCalculator. A nonce that repeats across
+   * two signatures reveals the private key, so never hand-roll this.
    */
   fun sign(digest: ByteArray, privateKey: ByteArray): ByteArray {
     require(digest.size == 32) { "digest must be 32 bytes" }
@@ -86,11 +83,8 @@ internal object Secp256k1 {
   }
 
   /**
-   * Finds which of the candidate public keys recoverable from (r, s) is ours.
-   *
-   * libsecp256k1's recoverable API returns this as a by-product of signing.
-   * Without it the only option is to try each candidate and compare, which is
-   * what this does.
+   * Finds which candidate public key recoverable from (r, s) is ours, by trying
+   * each and comparing — libsecp256k1 gets this free from signing, BC does not.
    */
   private fun recoveryId(
     r: BigInteger,

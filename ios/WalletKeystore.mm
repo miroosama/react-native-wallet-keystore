@@ -29,12 +29,8 @@ static NSString *const WKPublicKeyService = @"com.walletkeystore.publickey";
 static NSString *const WKKeyTagPrefix = @"com.walletkeystore.wrap.";
 
 /**
- * Zeroes a buffer in a way the optimizer cannot discard.
- *
- * A plain memset over memory that is never read again is dead-store-eliminated
- * at -O3, leaving the key in place. Writing through a volatile pointer forces
- * the stores. (memset_s would also work but requires __STDC_WANT_LIB_EXT1__,
- * which is not reliably set across the toolchains this gets built with.)
+ * Zeroes a buffer through a volatile pointer. A plain memset over memory that is
+ * never read again is dead-store-eliminated at -O3, leaving the key in place.
  */
 static void WKSecureZero(void *buffer, size_t length)
 {
@@ -48,12 +44,8 @@ static void WKSecureZero(void *buffer, size_t length)
 }
 
 /**
- * Shared libsecp256k1 context.
- *
- * Creating one is expensive (it builds precomputation tables), and the library
- * documents the context as safe for concurrent use once randomized. It is
- * randomized at creation to blind against side-channel recovery of the key
- * during signing.
+ * Shared libsecp256k1 context — expensive to build, safe to share once
+ * randomized. Randomizing blinds against side-channel key recovery.
  */
 static secp256k1_context *WKSecpContext(void)
 {
@@ -63,9 +55,7 @@ static secp256k1_context *WKSecpContext(void)
     context = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
     uint8_t seed[32];
     if (SecRandomCopyBytes(kSecRandomDefault, sizeof(seed), seed) == errSecSuccess) {
-      // Blinding is a hardening measure, not a correctness requirement — if it
-      // fails the context is still usable, so the result is deliberately
-      // tolerated rather than treated as fatal.
+      // Hardening only; the context still works if this fails.
       (void)secp256k1_context_randomize(context, seed);
     }
     WKSecureZero(seed, sizeof(seed));
@@ -78,12 +68,9 @@ static secp256k1_context *WKSecpContext(void)
 #pragma mark - Error mapping
 
 /**
- * Maps an LAError onto the cross-platform code set.
- *
- * There is no LOCKOUT_PERMANENT case: iOS resolves permanent biometric lockout
- * inside the system prompt by demanding the device passcode, so it never
- * surfaces the state to the app. Android's ERROR_LOCKOUT_PERMANENT has no iOS
- * counterpart, and faking one would be a lie.
+ * Maps an LAError onto the cross-platform code set. No LOCKOUT_PERMANENT case:
+ * iOS resolves permanent lockout inside the prompt by demanding the passcode,
+ * so it never reaches the app.
  */
 static NSString *WKCodeFromLAError(NSError *_Nullable error)
 {
@@ -137,9 +124,8 @@ static NSString *WKCodeFromOSStatus(OSStatus status)
     case errSecUserCanceled:
       return WKCodeUserCanceled;
 
-    // The access control could not be satisfied by any enrolled credential.
-    // After a biometric enrollment change against a .biometryCurrentSet key,
-    // this is permanent: the key material is gone, not merely unavailable.
+    // No enrolled credential can satisfy the access control. Against a
+    // .biometryCurrentSet key this is permanent, not a retryable failure.
     case errSecAuthFailed:
       return WKCodeKeyInvalidated;
 
@@ -152,9 +138,8 @@ static NSString *WKCodeFromOSStatus(OSStatus status)
 }
 
 /**
- * SecKey operations report failures as a CFError that may carry either an
- * LAError or an OSStatus, depending on whether authentication or the keychain
- * itself failed. Both have to be unwrapped or a cancel reads as a storage bug.
+ * A SecKey CFError may carry an LAError or an OSStatus depending on whether
+ * auth or the keychain failed. Unwrap both, or a cancel reads as a storage bug.
  */
 static NSString *WKCodeFromSecError(NSError *_Nullable error)
 {
@@ -213,6 +198,27 @@ static NSString *WKHexFromData(NSData *data)
 
 #pragma mark - Key and item helpers
 
+/**
+ * Picks an ECIES variant the key accepts, preferring the variable-IV form that
+ * Secure Enclave documents. Driven by the private key: the public half accepts
+ * more, so choosing on it could store data that never decrypts.
+ */
+static SecKeyAlgorithm _Nullable WKECIESAlgorithm(SecKeyRef privateKey)
+{
+  SecKeyAlgorithm candidates[] = {
+    kSecKeyAlgorithmECIESEncryptionCofactorVariableIVX963SHA256AESGCM,
+    kSecKeyAlgorithmECIESEncryptionCofactorX963SHA256AESGCM,
+  };
+
+  for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    if (SecKeyIsAlgorithmSupported(privateKey, kSecKeyOperationTypeDecrypt,
+                                   candidates[i])) {
+      return candidates[i];
+    }
+  }
+  return NULL;
+}
+
 static NSData *WKKeyTag(NSString *keyId)
 {
   return [[WKKeyTagPrefix stringByAppendingString:keyId]
@@ -233,19 +239,25 @@ static SecAccessControlCreateFlags WKAccessControlFlags(NSString *policy,
   BOOL biometricOnly = [policy isEqualToString:WKPolicyBiometricOnly];
   BOOL invalidates = [invalidation isEqualToString:WKInvalidationOnEnrollmentChange];
 
+  // Required for any Secure Enclave key that will perform private-key
+  // operations. Omitting it still creates the key and still allows public-key
+  // encryption, so the mistake only surfaces later, as "Operation is not
+  // allowed" on the first decrypt.
+  SecAccessControlCreateFlags flags = kSecAccessControlPrivateKeyUsage;
+
   if (biometricOnly) {
-    return invalidates ? kSecAccessControlBiometryCurrentSet
-                       : kSecAccessControlBiometryAny;
+    return flags | (invalidates ? kSecAccessControlBiometryCurrentSet
+                                : kSecAccessControlBiometryAny);
   }
 
   if (invalidates) {
     // Biometrics pinned to the current enrollment, but the passcode remains a
     // route in — otherwise this would be indistinguishable from biometricOnly.
-    return kSecAccessControlBiometryCurrentSet | kSecAccessControlOr |
+    return flags | kSecAccessControlBiometryCurrentSet | kSecAccessControlOr |
            kSecAccessControlDevicePasscode;
   }
 
-  return kSecAccessControlUserPresence;
+  return flags | kSecAccessControlUserPresence;
 }
 
 static SecKeyRef _Nullable WKCopyPrivateKey(NSString *keyId,
@@ -347,11 +359,8 @@ static NSDictionary *WKPublicKeyQuery(NSString *keyId)
       ? LAPolicyDeviceOwnerAuthenticationWithBiometrics
       : LAPolicyDeviceOwnerAuthentication;
 
-  // A fresh context per call is a security requirement, not tidiness: a reused
-  // LAContext can satisfy a later evaluation from a cached earlier success via
-  // touchIDAuthenticationAllowableReuseDuration, which for a wallet would mean
-  // signing without the user actually authenticating. Pinning the duration to
-  // zero makes that explicit and survives the default changing.
+  // Fresh context per call: a reused LAContext can satisfy a later evaluation
+  // from a cached success, which would mean signing without authenticating.
   LAContext *context = [LAContext new];
   context.touchIDAuthenticationAllowableReuseDuration = 0;
 
@@ -468,12 +477,17 @@ static NSDictionary *WKPublicKeyQuery(NSString *keyId)
     return;
   }
 
+  SecKeyAlgorithm algorithm = WKECIESAlgorithm(privateKey);
   SecKeyRef publicKey = SecKeyCopyPublicKey(privateKey);
   CFRelease(privateKey);
 
-  if (publicKey == NULL) {
+  if (publicKey == NULL || algorithm == NULL) {
+    if (publicKey != NULL) CFRelease(publicKey);
     [self deleteKeyMaterial:keyId];
-    onError(WKCodeStorageError, @"Could not derive the wrapping public key.");
+    onError(WKCodeStorageError,
+            algorithm == NULL
+                ? @"This device's key does not support any known ECIES variant."
+                : @"Could not derive the wrapping public key.");
     return;
   }
 
@@ -482,7 +496,7 @@ static NSDictionary *WKPublicKeyQuery(NSString *keyId)
   CFErrorRef encryptError = NULL;
   NSData *ciphertext = CFBridgingRelease(SecKeyCreateEncryptedData(
       publicKey,
-      kSecKeyAlgorithmECIESEncryptionCofactorX963SHA256AESGCM,
+      algorithm,
       (__bridge CFDataRef)secret,
       &encryptError));
   CFRelease(publicKey);
@@ -572,17 +586,30 @@ static NSDictionary *WKPublicKeyQuery(NSString *keyId)
     SecKeyRef privateKey = WKCopyPrivateKey(keyId, context, &keyStatus);
 
     if (privateKey == NULL) {
-      onError(WKCodeFromOSStatus(keyStatus),
+      // Reaching here means the ciphertext was found but its enclave key was
+      // not, so the secret is unrecoverable rather than absent. KEY_NOT_FOUND
+      // would send the user to store a new key instead of starting recovery.
+      onError(keyStatus == errSecItemNotFound ? WKCodeKeyInvalidated
+                                              : WKCodeFromOSStatus(keyStatus),
               keyStatus == errSecItemNotFound
-                  ? @"The wrapping key for this keyId is missing."
+                  ? @"The wrapping key no longer exists; this secret cannot be "
+                     "recovered."
                   : @"Could not load the wrapping key.");
+      return;
+    }
+
+    SecKeyAlgorithm algorithm = WKECIESAlgorithm(privateKey);
+    if (algorithm == NULL) {
+      CFRelease(privateKey);
+      onError(WKCodeStorageError,
+              @"The wrapping key does not support any known ECIES variant.");
       return;
     }
 
     CFErrorRef decryptError = NULL;
     NSData *plaintext = CFBridgingRelease(SecKeyCreateDecryptedData(
         privateKey,
-        kSecKeyAlgorithmECIESEncryptionCofactorX963SHA256AESGCM,
+        algorithm,
         (__bridge CFDataRef)ciphertext,
         &decryptError));
     CFRelease(privateKey);
@@ -590,7 +617,10 @@ static NSDictionary *WKPublicKeyQuery(NSString *keyId)
     if (plaintext == nil) {
       NSError *error = CFBridgingRelease(decryptError);
       onError(WKCodeFromSecError(error),
-              error.localizedDescription ?: @"Could not decrypt the secret.");
+              [NSString stringWithFormat:@"%@ (%@ %ld)",
+                                         error.localizedDescription
+                                             ?: @"Could not decrypt the secret.",
+                                         error.domain ?: @"?", (long)error.code]);
       return;
     }
 

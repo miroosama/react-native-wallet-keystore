@@ -14,15 +14,15 @@ import {
   generateKey,
   getBiometryType,
   getPublicKey,
-  hasSecret,
   getSecret,
+  hasSecret,
   importPrivateKey,
+  KeystoreError,
   signDigest,
   storeSecret,
   type AuthPolicy,
   type BiometryType,
   type InvalidationPolicy,
-  type KeystoreError,
 } from 'react-native-wallet-keystore';
 import { toKeystoreAccount } from 'react-native-wallet-keystore/viem';
 import { hashMessage, keccak256, recoverAddress, toHex } from 'viem';
@@ -87,9 +87,12 @@ export default function App() {
         ...prev,
       ]);
     } catch (error) {
-      const e = error as KeystoreError;
+      // Every rejection from this library is a KeystoreError, so `code` is
+      // readable without parsing the message.
+      const code = error instanceof KeystoreError ? error.code : 'UNKNOWN';
+      const message = error instanceof Error ? error.message : String(error);
       setOutcomes((prev) => [
-        { label, status: 'error', code: e.code, message: e.message, at },
+        { label, status: 'error', code, message, at },
         ...prev,
       ]);
     } finally {
@@ -238,15 +241,15 @@ export default function App() {
       </View>
 
       <View style={styles.segments}>
-        <Segment
+        <Segment<AuthPolicy>
           options={['biometricOrPasscode', 'biometricOnly', 'none']}
           value={policy}
-          onChange={(v) => setPolicy(v as AuthPolicy)}
+          onChange={setPolicy}
         />
-        <Segment
+        <Segment<InvalidationPolicy>
           options={['never', 'onEnrollmentChange']}
           value={invalidation}
-          onChange={(v) => setInvalidation(v as InvalidationPolicy)}
+          onChange={setInvalidation}
         />
       </View>
 
@@ -290,14 +293,14 @@ export default function App() {
   );
 }
 
-function Segment({
+function Segment<T extends string>({
   options,
   value,
   onChange,
 }: {
-  options: string[];
-  value: string;
-  onChange: (v: string) => void;
+  options: readonly T[];
+  value: T;
+  onChange: (v: T) => void;
 }) {
   return (
     <View style={styles.segment}>

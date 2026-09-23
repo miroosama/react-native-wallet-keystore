@@ -2,9 +2,8 @@ import NativeWalletKeystore from './NativeWalletKeystore';
 import { KeystoreError, toKeystoreError } from './errors';
 
 /**
- * iOS reports the exact modality. Android can only report which biometric
- * *hardware* is present, not which modality is enrolled, so it falls back to
- * the generic `'biometric'` when more than one is available.
+ * Android reports which biometric *hardware* exists, not which modality is
+ * enrolled, so it returns `'biometric'` when more than one is present.
  */
 export type BiometryType =
   | 'faceId'
@@ -18,7 +17,28 @@ export type BiometryType =
 
 export type AuthPolicy = 'biometricOnly' | 'biometricOrPasscode' | 'none';
 
+/**
+ * Whether the wrapping key is destroyed when biometric enrollment changes.
+ *
+ * Orthogonal to {@link AuthPolicy} on purpose: `'biometricOnly'` must never
+ * imply invalidation, or a user adding a fingerprint silently destroys their
+ * wallet. Opting in is explicit.
+ */
+export type InvalidationPolicy = 'onEnrollmentChange' | 'never';
+
 export const DEFAULT_AUTH_POLICY: AuthPolicy = 'biometricOrPasscode';
+export const DEFAULT_INVALIDATION_POLICY: InvalidationPolicy = 'never';
+
+/** Uncompressed SEC1 public key: `0x04` followed by 64 bytes. */
+export type PublicKeyHex = `0x${string}`;
+
+/** 65-byte Ethereum signature: `r || s || v`, with `v` 27 or 28. */
+export type SignatureHex = `0x${string}`;
+
+type KeyOptions = {
+  policy?: AuthPolicy;
+  invalidation?: InvalidationPolicy;
+};
 
 const BIOMETRY_TYPES: ReadonlySet<string> = new Set<BiometryType>([
   'faceId',
@@ -31,36 +51,55 @@ const BIOMETRY_TYPES: ReadonlySet<string> = new Set<BiometryType>([
   'none',
 ]);
 
+const HEX_PATTERN = /^(?:[0-9a-fA-F]{2})+$/;
+const HEX_32_BYTES = /^(?:0x)?[0-9a-fA-F]{64}$/;
+
+function strip0x(value: string): string {
+  return value.startsWith('0x') || value.startsWith('0X')
+    ? value.slice(2)
+    : value;
+}
+
+function prefix0x(value: string): `0x${string}` {
+  return (value.startsWith('0x') ? value : `0x${value}`) as `0x${string}`;
+}
+
+function assertKeyId(keyId: string): void {
+  if (typeof keyId !== 'string' || keyId.trim() === '') {
+    throw new KeystoreError('UNKNOWN', 'A non-empty `keyId` is required.');
+  }
+}
+
+function assertReason(reason: string, action: string): void {
+  // iOS raises on an empty localizedReason rather than failing gracefully, so
+  // this is checked before the bridge to keep both platforms consistent.
+  if (typeof reason !== 'string' || reason.trim() === '') {
+    throw new KeystoreError(
+      'UNKNOWN',
+      `A non-empty \`reason\` is required to ${action}.`
+    );
+  }
+}
+
 /**
- * Which biometric modality the device hardware supports.
+ * Which biometric modality the hardware supports, whether or not anything is
+ * enrolled. Resolves `'none'` when there is no hardware; never rejects.
  *
- * Reports the hardware modality even when nothing is enrolled, so callers can
- * write "Enable Face ID in Settings" rather than a generic message. Enrollment
- * state comes from {@link authenticate}, which rejects with `NOT_ENROLLED`.
- *
- * Resolves `'none'` when there is no biometric hardware; does not reject.
+ * Enrollment state comes from {@link authenticate} via `NOT_ENROLLED`.
  */
 export async function getBiometryType(): Promise<BiometryType> {
   const type = await NativeWalletKeystore.getBiometryType();
-  // An unrecognized value means a newer native layer than this JS — degrade to
-  // the generic type rather than leaking a string that isn't in the union.
-  if (!BIOMETRY_TYPES.has(type)) {
-    return 'biometric';
-  }
-  return type as BiometryType;
+  // A native layer newer than this JS could return a modality we don't know.
+  return (BIOMETRY_TYPES.has(type) ? type : 'biometric') as BiometryType;
 }
 
 /**
  * Prompts for device-owner authentication.
  *
- * @param reason Shown to the user as the prompt's message. Must be non-empty —
- *   iOS raises for an empty `localizedReason`, so it is rejected here first for
- *   a consistent error across platforms.
- * @param policy Defaults to `'biometricOrPasscode'`. `'none'` resolves `true`
- *   without prompting.
+ * A UX gate, not a security boundary — the boolean can be faked by a
+ * compromised bundle. Use {@link signDigest} where it actually matters.
  *
- * Resolves `true` on success. Never resolves `false` — every failure rejects
- * with a {@link KeystoreError} so a missed `await` cannot read as success.
+ * Never resolves `false`; every failure rejects.
  *
  * @throws {KeystoreError}
  */
@@ -69,12 +108,7 @@ export async function authenticate(
   policy: AuthPolicy = DEFAULT_AUTH_POLICY
 ): Promise<boolean> {
   try {
-    if (typeof reason !== 'string' || reason.trim() === '') {
-      throw new KeystoreError(
-        'UNKNOWN',
-        'A non-empty `reason` is required to authenticate.'
-      );
-    }
+    assertReason(reason, 'authenticate');
     return await NativeWalletKeystore.authenticate(reason, policy);
   } catch (error) {
     throw toKeystoreError(error);
@@ -82,56 +116,19 @@ export async function authenticate(
 }
 
 /**
- * Whether the wrapping key survives a change to the device's biometric
- * enrollment.
- *
- * Deliberately orthogonal to {@link AuthPolicy}: *which* authenticators are
- * accepted is a separate question from *when the key is destroyed*. Binding
- * them — letting `'biometricOnly'` imply invalidation, as several libraries do
- * — means a user adding a fingerprint silently destroys their wallet key. That
- * has to be an explicit opt-in.
- *
- * `'onEnrollmentChange'` is the stronger guarantee and the more dangerous
- * default, so the default is `'never'`.
- */
-export type InvalidationPolicy = 'onEnrollmentChange' | 'never';
-
-export const DEFAULT_INVALIDATION_POLICY: InvalidationPolicy = 'never';
-
-const HEX_PATTERN = /^(?:[0-9a-fA-F]{2})+$/;
-
-function assertKeyId(keyId: string): void {
-  if (typeof keyId !== 'string' || keyId.trim() === '') {
-    throw new KeystoreError('UNKNOWN', 'A non-empty `keyId` is required.');
-  }
-}
-
-/**
  * Stores a secret encrypted under a hardware-bound wrapping key.
  *
- * The secret is hex because the bridge cannot carry bytes, and because a hex
- * string is unambiguous about length in a way a UTF-8 string is not.
- *
- * Storing needs no authentication — only {@link getSecret} prompts. That
- * asymmetry is deliberate: it lets a wallet be provisioned in the background
- * and only demand the user at the moment of use.
- *
- * @throws {KeystoreError} `KEY_ALREADY_EXISTS` if `keyId` is taken.
+ * @throws {KeystoreError} `KEY_ALREADY_EXISTS` if `keyId` is taken; overwriting
+ *   is always deliberate.
  */
 export async function storeSecret(
   keyId: string,
   secretHex: string,
-  options: {
-    policy?: AuthPolicy;
-    invalidation?: InvalidationPolicy;
-  } = {}
+  options: KeyOptions = {}
 ): Promise<void> {
   try {
     assertKeyId(keyId);
 
-    // Validated here rather than natively so the two platforms cannot disagree
-    // about what counts as hex, and so an odd-length string fails before it is
-    // half-parsed into a key.
     if (typeof secretHex !== 'string' || !HEX_PATTERN.test(secretHex)) {
       throw new KeystoreError(
         'UNKNOWN',
@@ -153,14 +150,8 @@ export async function storeSecret(
 /**
  * Authenticates and returns the stored secret as hex.
  *
- * Unlike {@link authenticate}, the prompt here is not a check this library
- * performs and then trusts — the wrapping key is unusable until the OS has
- * validated the user, so a compromised JS bundle cannot skip it.
- *
- * The returned string lands in the JS heap, where it cannot be reliably zeroed
- * and persists until garbage collection. That is inherent to crossing the
- * bridge, and is why `signDigest` will exist: so the common path never surfaces
- * the key to JS at all. Prefer this only for user-initiated export.
+ * The prompt is raised by the keystore as a precondition of using the wrapping
+ * key, so it cannot be bypassed from JS.
  *
  * @throws {KeystoreError} `KEY_NOT_FOUND`, `KEY_INVALIDATED`, or any auth code.
  */
@@ -170,14 +161,7 @@ export async function getSecret(
 ): Promise<string> {
   try {
     assertKeyId(keyId);
-
-    if (typeof reason !== 'string' || reason.trim() === '') {
-      throw new KeystoreError(
-        'UNKNOWN',
-        'A non-empty `reason` is required to read a secret.'
-      );
-    }
-
+    assertReason(reason, 'read a secret');
     return await NativeWalletKeystore.getSecret(keyId, reason);
   } catch (error) {
     throw toKeystoreError(error);
@@ -194,11 +178,7 @@ export async function hasSecret(keyId: string): Promise<boolean> {
   }
 }
 
-/**
- * Removes the secret and its wrapping key. Idempotent — deleting a `keyId` that
- * is not present resolves rather than rejecting, so teardown paths do not have
- * to guard.
- */
+/** Removes the secret and its wrapping key. Idempotent. */
 export async function deleteSecret(keyId: string): Promise<void> {
   try {
     assertKeyId(keyId);
@@ -208,52 +188,27 @@ export async function deleteSecret(keyId: string): Promise<void> {
   }
 }
 
-// -----------------------------------------------------------------------------
-// secp256k1 keys and signing
-// -----------------------------------------------------------------------------
-
-/** Uncompressed SEC1 public key: `0x04` followed by 64 bytes. */
-export type PublicKeyHex = `0x${string}`;
-
-/** 65-byte Ethereum signature: `r || s || v`, with `v` 27 or 28. */
-export type SignatureHex = `0x${string}`;
-
-const HEX_32_BYTES = /^(?:0x)?[0-9a-fA-F]{64}$/;
-
-function strip0x(value: string): string {
-  return value.startsWith('0x') || value.startsWith('0X')
-    ? value.slice(2)
-    : value;
-}
-
-function prefix0x(value: string): `0x${string}` {
-  return (value.startsWith('0x') ? value : `0x${value}`) as `0x${string}`;
-}
-
 /**
  * Generates a secp256k1 keypair in hardware-wrapped storage.
  *
- * Entropy comes from the platform CSPRNG — `SecRandomCopyBytes` on iOS,
- * `SecureRandom` on Android — never from JavaScript, whose PRNG is not
- * cryptographically secure and whose state is observable to the bundle.
+ * Entropy comes from the platform CSPRNG, never from JavaScript, and the
+ * private key never crosses the bridge.
  *
- * The private key never crosses the bridge. Only the public key is returned.
- *
- * @returns The uncompressed public key. Derive the address with viem's
- *   `publicKeyToAddress`.
+ * @returns The uncompressed public key.
  */
 export async function generateKey(
   keyId: string,
-  options: { policy?: AuthPolicy; invalidation?: InvalidationPolicy } = {}
+  options: KeyOptions = {}
 ): Promise<PublicKeyHex> {
   try {
     assertKeyId(keyId);
-    const publicKey = await NativeWalletKeystore.generateKey(
-      keyId,
-      options.policy ?? DEFAULT_AUTH_POLICY,
-      options.invalidation ?? DEFAULT_INVALIDATION_POLICY
+    return prefix0x(
+      await NativeWalletKeystore.generateKey(
+        keyId,
+        options.policy ?? DEFAULT_AUTH_POLICY,
+        options.invalidation ?? DEFAULT_INVALIDATION_POLICY
+      )
     );
-    return prefix0x(publicKey);
   } catch (error) {
     throw toKeystoreError(error);
   }
@@ -262,15 +217,13 @@ export async function generateKey(
 /**
  * Imports an existing secp256k1 private key.
  *
- * @throws {KeystoreError} `INVALID_KEY` if the key is not in [1, n-1]. Zero and
- *   values at or above the curve order are not merely malformed — they produce
- *   signatures that leak or verify against nothing, so they are rejected rather
- *   than clamped.
+ * @throws {KeystoreError} `INVALID_KEY` unless the key is in [1, n-1]. Keys
+ *   outside that range are rejected rather than clamped.
  */
 export async function importPrivateKey(
   keyId: string,
   privateKeyHex: string,
-  options: { policy?: AuthPolicy; invalidation?: InvalidationPolicy } = {}
+  options: KeyOptions = {}
 ): Promise<PublicKeyHex> {
   try {
     assertKeyId(keyId);
@@ -285,15 +238,15 @@ export async function importPrivateKey(
       );
     }
 
-    // The range check itself stays native, where the curve order is already
-    // available and constant-time comparison is possible.
-    const publicKey = await NativeWalletKeystore.importPrivateKey(
-      keyId,
-      strip0x(privateKeyHex),
-      options.policy ?? DEFAULT_AUTH_POLICY,
-      options.invalidation ?? DEFAULT_INVALIDATION_POLICY
+    // The range check stays native, where the curve order is already at hand.
+    return prefix0x(
+      await NativeWalletKeystore.importPrivateKey(
+        keyId,
+        strip0x(privateKeyHex),
+        options.policy ?? DEFAULT_AUTH_POLICY,
+        options.invalidation ?? DEFAULT_INVALIDATION_POLICY
+      )
     );
-    return prefix0x(publicKey);
   } catch (error) {
     throw toKeystoreError(error);
   }
@@ -312,13 +265,12 @@ export async function getPublicKey(keyId: string): Promise<PublicKeyHex> {
 /**
  * Authenticates, then signs a 32-byte digest.
  *
- * Only a digest crosses the boundary — never a message, never a transaction.
- * Keccak and all EIP-191/712/155 encoding stay in JS, which keeps this module
- * curve-specific but chain-agnostic, and keeps a hashing implementation (and
- * the SHA3-vs-Keccak padding trap) out of the native layer entirely.
+ * Only a digest crosses the boundary — never a message or a transaction.
+ * Keccak and EIP-191/712/155 encoding stay in JS, which keeps this module
+ * curve-specific but chain-agnostic.
  *
- * @returns 65 bytes, `r || s || v`. `s` is low-s normalized per EIP-2 and `v`
- *   is 27/28, so the output matches viem byte-for-byte.
+ * @returns 65 bytes, `r || s || v`, low-s normalized per EIP-2 with `v` of
+ *   27/28 — byte-identical to viem.
  */
 export async function signDigest(
   keyId: string,
@@ -335,12 +287,7 @@ export async function signDigest(
       );
     }
 
-    if (typeof reason !== 'string' || reason.trim() === '') {
-      throw new KeystoreError(
-        'UNKNOWN',
-        'A non-empty `reason` is required to sign.'
-      );
-    }
+    assertReason(reason, 'sign');
 
     return prefix0x(
       await NativeWalletKeystore.signDigest(keyId, strip0x(digestHex), reason)
@@ -353,9 +300,8 @@ export async function signDigest(
 /**
  * Authenticates, then returns the raw private key.
  *
- * Intended for user-initiated backup only. The returned string lands in the JS
- * heap where it cannot be zeroed, so the everyday path should be
- * {@link signDigest}, which never surfaces the key at all.
+ * For user-initiated backup only. The result lands in the JS heap where it
+ * cannot be zeroed, so prefer {@link signDigest} for everyday use.
  */
 export async function exportPrivateKey(
   keyId: string,
@@ -363,14 +309,7 @@ export async function exportPrivateKey(
 ): Promise<string> {
   try {
     assertKeyId(keyId);
-
-    if (typeof reason !== 'string' || reason.trim() === '') {
-      throw new KeystoreError(
-        'UNKNOWN',
-        'A non-empty `reason` is required to export a private key.'
-      );
-    }
-
+    assertReason(reason, 'export a private key');
     return prefix0x(await NativeWalletKeystore.exportPrivateKey(keyId, reason));
   } catch (error) {
     throw toKeystoreError(error);

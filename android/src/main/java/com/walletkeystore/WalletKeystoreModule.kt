@@ -17,12 +17,9 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
   NativeWalletKeystoreSpec(reactContext) {
 
   /**
-   * Where an operation's result goes.
-   *
-   * The storage operations are reused internally by the signing ones, which
-   * need to intercept the result rather than forward it to JS. Settling through
-   * this instead of a `Promise` keeps that composition honest — there is no
-   * hand-written stand-in for React Native's interface to drift out of date.
+   * Where an operation's result goes. Signing reuses the storage operations and
+   * needs to intercept their result, and this avoids hand-rolling a `Promise`
+   * stand-in that would drift from React Native's interface.
    */
   private interface Settler {
     fun resolve(value: Any?)
@@ -30,12 +27,8 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
   }
 
   /**
-   * Settles a promise exactly once.
-   *
-   * BiometricPrompt can deliver a terminal callback while an earlier failure
-   * path is already unwinding — a cancel racing an error, most often. Settling
-   * a React Native promise twice throws, so the race is collapsed here rather
-   * than guarded at each call site.
+   * Settles exactly once. BiometricPrompt can deliver a terminal callback while
+   * an earlier failure is still unwinding, and settling twice throws.
    */
   private class PromiseGuard(private val promise: Promise) : Settler {
     private val settled = AtomicBoolean(false)
@@ -65,10 +58,8 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
   override fun getBiometryType(promise: Promise) {
     val pm = reactApplicationContext.packageManager
 
-    // PackageManager reports hardware presence only — Android has no API that
-    // reveals which modality is actually enrolled. When several are present we
-    // cannot attribute an authentication to one of them, so report the generic
-    // type instead of guessing.
+    // PackageManager reports hardware presence only; Android has no API for
+    // which modality is enrolled. Several present means we cannot attribute.
     val hasFingerprint = pm.hasSystemFeature(PackageManager.FEATURE_FINGERPRINT)
     val hasFace =
       Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
@@ -134,10 +125,9 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
             guard.reject(mapAuthError(errorCode), errString.toString())
           }
 
-          // onAuthenticationFailed is intentionally not overridden. It fires on
-          // every rejected attempt — a non-matching fingerprint — while the
-          // prompt stays up for a retry. Settling there would end the flow on
-          // the user's first fumble and leave the prompt orphaned on screen.
+          // onAuthenticationFailed is deliberately not overridden: it fires per
+          // rejected attempt while the prompt stays up, so settling there would
+          // end the flow on the user's first fumble.
         }
 
         BiometricPrompt(activity, ContextCompat.getMainExecutor(activity), callback)
@@ -161,12 +151,9 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
   ) = storeSecretInto(keyId, secretHex, policy, invalidation, PromiseGuard(promise))
 
   /**
-   * Note the platform asymmetry against iOS: there, encryption uses only the
-   * public half of an enclave keypair and needs no authentication. Android's
-   * wrapping key is symmetric AES-GCM, and `setUserAuthenticationRequired(true)`
-   * governs every use of it, so storing prompts too. Making storage silent here
-   * would mean dropping the auth requirement from the key entirely, which is
-   * the one property worth having.
+   * Unlike iOS, storing prompts here: the wrapping key is symmetric, and
+   * `setUserAuthenticationRequired(true)` governs every use of it. Silent
+   * storage would mean dropping that requirement entirely.
    */
   private fun storeSecretInto(
     keyId: String,
@@ -264,7 +251,13 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
     }
 
     if (key == null) {
-      settler.reject(CODE_KEY_NOT_FOUND, "The wrapping key for this keyId is missing.")
+      // Ciphertext present but wrapping key gone: unrecoverable, not absent.
+      // Removing the device lock deletes auth-bound keys outright rather than
+      // throwing KeyPermanentlyInvalidatedException, so it lands here.
+      settler.reject(
+        CODE_KEY_INVALIDATED,
+        "The wrapping key no longer exists; this secret cannot be recovered."
+      )
       return
     }
 
@@ -559,11 +552,9 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
     return builder.build()
   }
 
-  // BIOMETRIC_STRONG or DEVICE_CREDENTIAL is rejected by setAllowedAuthenticators
-  // below API 30, so the pre-30 path degrades to biometric-only rather than
-  // silently accepting a weaker credential: a caller asking for
-  // 'biometricOrPasscode' on API 24-29 gets a biometric prompt, and
-  // NOT_ENROLLED if nothing is enrolled.
+  // setAllowedAuthenticators rejects BIOMETRIC_STRONG or DEVICE_CREDENTIAL below
+  // API 30, so API 24-29 degrades to biometric-only rather than silently
+  // accepting a weaker credential.
   private fun authenticatorsFor(policy: String): Int =
     WalletKeystoreCrypto.authenticatorsFor(policy)
 

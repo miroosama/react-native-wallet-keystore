@@ -164,14 +164,8 @@ internal object WalletKeystoreCrypto {
   }
 
   /**
-   * Whether the key demands authentication before use.
-   *
-   * Asked of the key itself rather than inferred from the policy string,
-   * because the policy a secret was stored under is not recorded anywhere and
-   * the caller may pass a different one later.
-   *
-   * Fails closed: if the metadata cannot be read we assume authentication is
-   * required, so a failure here can never silently skip the prompt.
+   * Asked of the key rather than inferred from a policy string, which is not
+   * recorded anywhere. Fails closed: unreadable metadata means prompt.
    */
   fun requiresAuth(key: SecretKey): Boolean = try {
     val factory = SecretKeyFactory.getInstance(key.algorithm, ANDROID_KEYSTORE)
@@ -182,10 +176,8 @@ internal object WalletKeystoreCrypto {
   }
 
   /**
-   * Keystore reports "used without authentication" as a wrapped
-   * IllegalBlockSizeException rather than UserNotAuthenticatedException, so the
-   * cause chain has to be walked. Missing this reads as a generic storage
-   * failure and the prompt never appears.
+   * Keystore wraps "used without authentication" in an IllegalBlockSizeException
+   * rather than throwing UserNotAuthenticatedException, so walk the cause chain.
    */
   fun isNotAuthenticated(t: Throwable): Boolean {
     var current: Throwable? = t

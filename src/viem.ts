@@ -16,12 +16,9 @@ import { publicKeyToAddress, toAccount } from 'viem/accounts';
 import { getPublicKey, signDigest } from './keystore';
 
 export type KeystoreAccountOptions = {
-  /** Shown in the authentication prompt. One prompt per signature. */
+  /** Shown in the authentication prompt. */
   reason?: string;
-  /**
-   * Supply the public key if it is already known, to skip a native round-trip.
-   * The address is derived from it, so it must belong to `keyId`.
-   */
+  /** Skips a native round-trip. Must belong to `keyId`. */
   publicKey?: Hex;
 };
 
@@ -30,9 +27,8 @@ const DEFAULT_REASON = 'Sign with your wallet key';
 /**
  * Adapts a hardware-wrapped key into a viem {@link LocalAccount}.
  *
- * Every signing path hashes in JS and sends only a 32-byte digest to native,
- * so EIP-191, EIP-712 and transaction serialization all stay in viem where
- * they are already correct and audited.
+ * Every path hashes in JS and sends only a 32-byte digest to native, leaving
+ * EIP-191, EIP-712 and transaction serialization to viem.
  *
  * ```ts
  * const account = await toKeystoreAccount('wallet-1');
@@ -40,9 +36,8 @@ const DEFAULT_REASON = 'Sign with your wallet key';
  * await client.sendTransaction({ to: '0x…', value: 1n });
  * ```
  *
- * Note that each signature raises its own authentication prompt. That is the
- * point — the key is unusable without it — but it means batching several
- * signatures will prompt several times.
+ * Each signature raises its own authentication prompt, so batching several will
+ * prompt several times.
  */
 export async function toKeystoreAccount(
   keyId: string,
@@ -51,24 +46,21 @@ export async function toKeystoreAccount(
   const reason = options.reason ?? DEFAULT_REASON;
   const publicKey = options.publicKey ?? (await getPublicKey(keyId));
 
-  // Derived locally rather than returned by native: the address is a pure
-  // function of the public key, and keccak has no business in the native layer.
+  // Derived here rather than natively: the address is a pure function of the
+  // public key, and keccak has no business in the native layer.
   const address = publicKeyToAddress(publicKey);
 
   const sign = (digest: Hex) =>
     signDigest(keyId, digest, reason) as Promise<Hex>;
 
-  return toAccount({
+  const account = toAccount({
     address,
-    // `toAccount` narrows on the shape it is given; the cast pins the result to
-    // LocalAccount rather than the JsonRpcAccount branch of the union.
 
     async sign({ hash }: { hash: Hex }) {
       return sign(hash);
     },
 
     async signMessage({ message }: { message: SignableMessage }) {
-      // EIP-191 prefixing happens here, not natively.
       return sign(hashMessage(message));
     },
 
@@ -88,9 +80,9 @@ export async function toKeystoreAccount(
     ) {
       const serializer = args?.serializer ?? serializeTransaction;
 
-      // Sign the hash of the *unsigned* serialization, then re-serialize with
-      // the signature attached — the EIP-155 / typed-transaction rules live in
-      // viem's serializer, which already handles every tx type.
+      // Sign the hash of the unsigned serialization, then re-serialize with the
+      // signature attached; viem's serializer owns the EIP-155 and typed-tx
+      // rules for every transaction type.
       const unsigned = (await serializer(transaction)) as Hex;
       const signature = await sign(keccak256(unsigned));
 
@@ -100,5 +92,8 @@ export async function toKeystoreAccount(
         v: BigInt(parseInt(signature.slice(130, 132), 16)),
       })) as Hex;
     },
-  }) as LocalAccount;
+  });
+
+  // toAccount's return type is a union; this pins it to the local branch.
+  return account as LocalAccount;
 }
