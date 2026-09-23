@@ -1,7 +1,7 @@
 {
   "name": "react-native-wallet-keystore",
   "version": "0.1.0",
-  "description": "Hardware-protected wallet key storage with authenticated signing for React Native",
+  "description": "Hardware-protected secp256k1 wallet keys for React Native \u2014 Secure Enclave and Android Keystore, with a viem adapter",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
   "exports": {
@@ -50,7 +50,17 @@
   "keywords": [
     "react-native",
     "ios",
-    "android"
+    "android",
+    "ethereum",
+    "wallet",
+    "secp256k1",
+    "viem",
+    "secure-enclave",
+    "android-keystore",
+    "biometrics",
+    "signing",
+    "keychain",
+    "web3"
   ],
   "repository": {
     "type": "git",
