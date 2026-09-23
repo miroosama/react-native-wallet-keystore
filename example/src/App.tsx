@@ -30,7 +30,13 @@ import { privateKeyToAccount } from 'viem/accounts';
 
 const KEY_ID = 'demo-wallet';
 
-/** The same vector the Jest known-answer tests assert against. */
+/**
+ * PUBLICLY KNOWN TEST KEY — never use it for real funds.
+ *
+ * A fixed key is what makes the known-answer test possible: a random one has no
+ * expected signature to compare against. Real apps generate a key or import the
+ * user's own. This is the same vector the Jest tests assert against.
+ */
 const KNOWN_KEY =
   '0x4c0883a69102937d6231471b5dbb6204fe512961708279e2d0f3d5f0f0f0a1b2';
 const KNOWN_DIGEST = keccak256(toHex('wallet-keystore-vector-1'));
@@ -242,7 +248,7 @@ export default function App() {
 
       <View style={styles.segments}>
         <Segment<AuthPolicy>
-          options={['biometricOrPasscode', 'biometricOnly', 'none']}
+          options={['biometricOrPasscode', 'biometricOnly']}
           value={policy}
           onChange={setPolicy}
         />

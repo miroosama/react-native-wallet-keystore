@@ -15,7 +15,7 @@ export type BiometryType =
   | 'biometric'
   | 'none';
 
-export type AuthPolicy = 'biometricOnly' | 'biometricOrPasscode' | 'none';
+export type AuthPolicy = 'biometricOnly' | 'biometricOrPasscode';
 
 /**
  * Whether the wrapping key is destroyed when biometric enrollment changes.

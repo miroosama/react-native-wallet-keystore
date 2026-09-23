@@ -86,11 +86,6 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
   override fun authenticate(reason: String, policy: String, promise: Promise) {
     val guard = PromiseGuard(promise)
 
-    if (policy == POLICY_NONE) {
-      guard.resolve(true)
-      return
-    }
-
     if (reason.isBlank()) {
       guard.reject(CODE_UNKNOWN, "A non-empty `reason` is required to authenticate.")
       return
@@ -188,11 +183,6 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
     } catch (e: Exception) {
       WalletKeystoreCrypto.deleteKey(keyId)
       settler.reject(classify(e), e.message ?: "Could not initialize encryption.")
-      return
-    }
-
-    if (policy == POLICY_NONE) {
-      finishStore(settler, keyId, secret, cipher)
       return
     }
 
@@ -619,7 +609,6 @@ class WalletKeystoreModule(reactContext: ReactApplicationContext) :
 
     internal const val POLICY_BIOMETRIC_ONLY = "biometricOnly"
     internal const val POLICY_BIOMETRIC_OR_PASSCODE = "biometricOrPasscode"
-    internal const val POLICY_NONE = "none"
     internal const val INVALIDATION_ON_ENROLLMENT_CHANGE = "onEnrollmentChange"
 
     private const val CODE_NOT_AVAILABLE = "NOT_AVAILABLE"

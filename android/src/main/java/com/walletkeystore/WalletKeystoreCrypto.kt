@@ -97,8 +97,6 @@ internal object WalletKeystoreCrypto {
     policy: String,
     invalidation: String
   ): GeneratedKey {
-    val requiresAuth = policy != WalletKeystoreModule.POLICY_NONE
-
     fun build(strongBox: Boolean): SecretKey {
       val builder = KeyGenParameterSpec.Builder(
         alias(keyId),
@@ -107,33 +105,30 @@ internal object WalletKeystoreCrypto {
         .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
         .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
         .setKeySize(256)
-        .setUserAuthenticationRequired(requiresAuth)
+        .setUserAuthenticationRequired(true)
 
-      if (requiresAuth) {
-        // Pinning the key to the current biometric enrollment destroys it when
-        // the user adds or removes a fingerprint. That is the whole point of
-        // the invalidation axis, and why it is never implied by the auth
-        // policy: opting in silently would lose wallets.
-        builder.setInvalidatedByBiometricEnrollment(
-          invalidation == WalletKeystoreModule.INVALIDATION_ON_ENROLLMENT_CHANGE
+      // Pinning the key to the current biometric enrollment destroys it when
+      // the user adds or removes a fingerprint. That is why invalidation is
+      // never implied by the auth policy: opting in silently would lose wallets.
+      builder.setInvalidatedByBiometricEnrollment(
+        invalidation == WalletKeystoreModule.INVALIDATION_ON_ENROLLMENT_CHANGE
+      )
+
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        // 0 means "authenticate for every single use", which is what makes the
+        // CryptoObject binding meaningful — a time window would let a later
+        // operation ride on an earlier authentication.
+        builder.setUserAuthenticationParameters(
+          0,
+          if (policy == WalletKeystoreModule.POLICY_BIOMETRIC_ONLY) {
+            KeyProperties.AUTH_BIOMETRIC_STRONG
+          } else {
+            KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL
+          }
         )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-          // 0 means "authenticate for every single use", which is what makes
-          // the CryptoObject binding meaningful — a time window would let a
-          // later operation ride on an earlier authentication.
-          builder.setUserAuthenticationParameters(
-            0,
-            if (policy == WalletKeystoreModule.POLICY_BIOMETRIC_ONLY) {
-              KeyProperties.AUTH_BIOMETRIC_STRONG
-            } else {
-              KeyProperties.AUTH_BIOMETRIC_STRONG or KeyProperties.AUTH_DEVICE_CREDENTIAL
-            }
-          )
-        } else {
-          @Suppress("DEPRECATION")
-          builder.setUserAuthenticationValidityDurationSeconds(-1)
-        }
+      } else {
+        @Suppress("DEPRECATION")
+        builder.setUserAuthenticationValidityDurationSeconds(-1)
       }
 
       if (strongBox && Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {

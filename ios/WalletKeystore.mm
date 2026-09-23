@@ -7,7 +7,6 @@
 #import <secp256k1_recovery.h>
 
 static NSString *const WKPolicyBiometricOnly = @"biometricOnly";
-static NSString *const WKPolicyNone = @"none";
 static NSString *const WKInvalidationOnEnrollmentChange = @"onEnrollmentChange";
 
 static NSString *const WKCodeNotAvailable = @"NOT_AVAILABLE";
@@ -343,11 +342,6 @@ static NSDictionary *WKPublicKeyQuery(NSString *keyId)
              resolve:(RCTPromiseResolveBlock)resolve
               reject:(RCTPromiseRejectBlock)reject
 {
-  if ([policy isEqualToString:WKPolicyNone]) {
-    resolve(@YES);
-    return;
-  }
-
   // evaluatePolicy raises NSInvalidArgumentException on an empty reason rather
   // than failing gracefully, so it is rejected before we get there.
   if (reason.length == 0) {
