@@ -1,7 +1,7 @@
 {
   "name": "react-native-wallet-keystore",
   "version": "0.1.0",
-  "description": "Hardware-protected secp256k1 wallet keys for React Native \u2014 Secure Enclave and Android Keystore, with a viem adapter",
+  "description": "Hardware-protected secp256k1 wallet keys for React Native — Secure Enclave and Android Keystore, with a viem adapter",
   "main": "./lib/module/index.js",
   "types": "./lib/typescript/src/index.d.ts",
   "exports": {
@@ -43,9 +43,7 @@
     "typecheck": "tsc",
     "lint": "eslint \"**/*.{js,ts,tsx}\"",
     "test": "jest",
-    "release": "release-it --only-version",
-    "web": "vite",
-    "build:web": "vite build"
+    "release": "release-it --only-version"
   },
   "keywords": [
     "react-native",
@@ -98,7 +96,6 @@
     "react": "19.2.3",
     "react-native": "0.86.2",
     "react-native-builder-bob": "^0.43.1",
-    "react-native-web": "~0.21.2",
     "release-it": "^21.0.1",
     "turbo": "^2.10.8",
     "typescript": "^6.0.3",
@@ -194,8 +191,7 @@
       "eslint",
       "jest",
       "lefthook",
-      "release-it",
-      "vite"
+      "release-it"
     ],
     "version": "0.63.1"
   },
